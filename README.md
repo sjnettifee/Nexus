@@ -6,7 +6,12 @@
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-AGPLv3-7c6af7.svg" alt="License: AGPLv3">
   </a>
+  <a href="https://github.com/sjnettifee">
+    <img src="https://img.shields.io/badge/author-Shea%20Nettifee-7c6af7.svg" alt="Author: Shea Nettifee">
+  </a>
 </p>
+
+<p align="center"><sub>Designed and built by <strong>Shea Nettifee</strong> — a year-long solo project.</sub></p>
 
 Nexus is a free, local, multi-model inference engine built to get real
 large-language-model performance out of hardware you already own — a
@@ -67,4 +72,12 @@ can be linked directly with no HTTP layer at all. See the
 ## License
 
 Nexus is released under the **GNU Affero General Public License v3.0**
-(AGPLv3) — see [`LICENSE`](LICENSE) for the full text.
+(AGPLv3) — see [`LICENSE`](LICENSE) for the full text, and
+[`NOTICE`](NOTICE) for copyright and authorship.
+
+## Author
+
+Nexus was designed and built by **Shea Nettifee**
+([sjnettifee@gmail.com](mailto:sjnettifee@gmail.com)) over roughly a
+year of solo development, with AI assistance (Claude, and earlier
+development help from ChatGPT) used throughout as a development tool.
