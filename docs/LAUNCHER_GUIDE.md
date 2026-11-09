@@ -262,6 +262,24 @@ land in that model's own states folder automatically.
   browser" launches (useful for a portable browser carried on a USB
   stick alongside Nexus itself).
 
+> **Windows note:** the first time you set "Who can connect" to
+> "Anyone on my network" (or the first time another device tries to
+> reach a model that's still on "Only this computer," depending on
+> your setup), Windows will likely pop up a **Windows Defender
+> Firewall** prompt asking whether to allow `nexus_server.exe` (and/or
+> `nexus_launcher.exe`) access on private/public networks. You have to
+> click **Allow** — until you do, nothing outside (and sometimes
+> nothing *inside*) your machine can actually reach the server, even
+> though the launcher itself shows it as running. If you miss that
+> prompt or dismiss it, go to **Windows Security → Firewall & network
+> protection → Allow an app through firewall** and enable both
+> programs manually. Also don't assume port 8080 is free on a Windows
+> machine — other software (IIS, Skype, various dev tools) commonly
+> grabs it. If a model won't start or won't start cleanly, try a
+> different port in the **Network** card before assuming something
+> else is wrong.
+  stick alongside Nexus itself).
+
 #### Speed and accuracy
 Two toggles, both on by default: storing the output layer as Q8_0, and
 using 8-bit math for K-quant matrices during generation. Both are

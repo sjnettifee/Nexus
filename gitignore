@@ -1,0 +1,39 @@
+# Build output
+build/
+cmake-build-*/
+out/
+bin/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+
+# Runtime / user data (created automatically, never ship someone else's)
+nexus-data/
+models/
+loras/
+*.kv
+*.kvc
+*.tokens
+
+# IDE / editor junk
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Packaging scratch (if build_release.sh stages here)
+dist/
+release/

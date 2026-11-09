@@ -63,17 +63,58 @@ Nexus's server exposes a full HTTP/SSE API, and its `Engine` C++ class
 can be linked directly with no HTTP layer at all. See the
 **[Engine / API Guide](docs/ENGINE_API_GUIDE.md)**.
 
+## Troubleshooting
+
+- **Windows: another device on my network can't connect.** Windows
+  Defender Firewall will prompt the first time this happens — you
+  have to click **Allow**, or it'll quietly block the connection with
+  no error on the Nexus side. Missed the prompt? Go to **Windows
+  Security → Firewall & network protection → Allow an app through
+  firewall** and enable `nexus_server.exe`/`nexus_launcher.exe`
+  manually. See the [Launcher Guide](docs/LAUNCHER_GUIDE.md#network)
+  for more.
+- **Port 8080 won't bind / model won't start.** Something else on
+  your machine (common on Windows) may already be using it. Pick a
+  different port in the launcher's Network card.
+
 ## Building from source
 
+Requires CMake 3.18+, a C++17 compiler, [Ninja](https://ninja-build.org/),
+and a Vulkan shader compiler (`glslc` or `glslangValidator`) for GPU
+support. Linux/macOS/Windows (MSYS2 MinGW64 shell):
+
+```sh
+scripts/build_release.sh            # builds CPU tiers v2 v3 v4 -> ./dist
+scripts/build_release.sh v3         # just one tier
+OUT=/path/to/folder scripts/build_release.sh
 ```
-# see CMakeLists.txt for build instructions
+
+This builds `nexus_server` (the small dispatcher every user actually
+runs — no `-march`, works on any CPU) plus a `nexus_server_v2/v3/v4` +
+`libnexus_v2/v3/v4` pair for each CPU tier (SSE4.2 / AVX2+FMA /
+AVX-512); the dispatcher picks the best one your CPU supports at
+startup. Everything lands in `dist/` (and your project root), ready to
+zip or copy to a USB stick.
+
+Prefer driving CMake yourself instead of the script:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEXUS_VULKAN=ON
+cmake --build build --parallel
 ```
+
+Useful CMake options: `-DNEXUS_TIER=v2|v3|v4|native`,
+`-DNEXUS_VULKAN=ON` (GPU support — off by default), `-DNEXUS_CUDA=ON`
+/ `-DNEXUS_ROCM=ON` (optional, off by default), `-DNEXUS_PYTHON=ON`
+(pybind11 bindings, off by default).
 
 ## License
 
 Nexus is released under the **GNU Affero General Public License v3.0**
-(AGPLv3) — see [`LICENSE`](LICENSE) for the full text, and
-[`NOTICE`](NOTICE) for copyright and authorship.
+(AGPLv3) — see [`LICENSE`](LICENSE) for the full text,
+[`NOTICE`](NOTICE) for copyright and authorship, and
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the bundled
+Dear ImGui and Roboto components.
 
 ## Author
 
