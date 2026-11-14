@@ -25,8 +25,8 @@ the first start to every server flag and API endpoint.
 
 ## What it does on ordinary hardware
 
-The development machine is a desktop with **25 GB of DDR4**, a **3 GB GTX 1060**
-from 2016 and a **$20 AMD R9 290** added as a helper card. On it, Nexus runs
+The development machine is a desktop with **25 GB of DDR4** and a **3 GB GTX 1060**
+from 2016. On it, Nexus runs
 **Qwen 3.6 27B** (4-bit):
 
 - an **11,400-token prompt read in about 4½ minutes** (~42 tokens per second),
