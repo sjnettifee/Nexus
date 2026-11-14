@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexus Code Hardening</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/render.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <div id="nxNote" class="popnote" style="display:none">
+    <b>Can't find the Nexus server.</b> To pick models from a list and have this tool load and unload them, put this tool's folder next to
+    the launcher (for example <span class="mono">&lt;launcher folder&gt;/harden/</span>) and reload this page -- or set the folder in the Models card.
+    Servers you start yourself still work by address.
+    <button class="secondary tiny" id="nxNoteClose">OK</button>
+  </div>
+  <h1><span class="dia"></span> Nexus Code Hardening</h1>
+  <p class="muted">Scans a codebase, splits it into whole-file chunks under a token cap, runs an editable chain of
+     prompts over each chunk (live, step by step), then optionally runs a final pass over all the results, on
+     whichever models you choose.</p>
+
+  <div class="card" id="lastProj" style="display:none">
+    <div class="cardhead"><h2>Pick up where you left off</h2></div>
+    <div>Last project: <b id="lastProjPath" class="mono"></b>
+      <button id="btnLastProj" type="button" style="margin-left:10px">Open it</button>
+      <span class="muted small" style="margin-left:8px">or choose a folder below to start a new one</span></div>
+  </div>
+
+  <div class="card" id="savesCard">
+    <div class="cardhead"><h2>Saved reports</h2><button class="secondary tiny" id="btnRefreshSaves">Refresh</button></div>
+    <div id="savesList" class="muted">loading...</div>
+  </div>
+
+  <div class="card viewer" id="viewerCard" style="display:none">
+    <div class="cardhead">
+      <h2 id="viewerTitle">Saved report</h2>
+      <div class="btnrow">
+        <button class="secondary tiny" id="vExportAll">Export all (.md)</button>
+        <button class="secondary tiny" id="vExportFinal">Export final (.md)</button>
+        <button class="secondary tiny" id="vClose">Close</button>
+      </div>
+    </div>
+    <div class="muted" id="viewerMeta"></div>
+    <h3>Chunk results</h3><div id="viewerChunks"></div>
+    <h3 id="viewerFinalHdr">Final pass</h3><div id="viewerFinal"></div>
+    <div id="viewerFu" style="display:none"><h3>Follow-up conversation</h3><div id="viewerFuTurns"></div>
+      <button id="vResume" type="button">Continue this conversation</button> <span class="muted small" id="vResumeNote"></span></div>
+  </div>
+
+  <div class="card">
+    <h2>1. Project</h2>
+    <div class="row">
+      <div><label>Project folder (full path, on this computer)</label>
+        <div class="inline"><input id="root" type="text" placeholder="/home/you/code/myproject"><button class="secondary" id="btnBrowse" type="button">Browse...</button></div>
+        <select id="recent" style="margin-top:6px;display:none"><option value="">Recent projects...</option></select></div>
+      <div style="max-width:160px"><label>Token cap / chunk</label><input id="cap" type="number" value="150000" step="1000"></div>
+      <div style="max-width:190px"><label title="Part size when an oversized file is split for the large-context model">Large-context cap / part</label><input id="capLarge" type="number" value="250000" step="1000"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnLoad">Load / create project</button>
+      <button id="btnNewProject" class="secondary" type="button" title="Clears this page so you can pick another folder. Nothing is deleted.">New project</button>
+      <button id="btnScan" class="secondary" disabled>Scan &amp; tokenize</button>
+      <button id="btnDeleteProject" class="danger secondary" disabled title="Clears this tool's saved scan/chunk/result data for this project. Your source files and saved snapshots are not touched.">Delete this project's working data</button>
+      <span id="projStatus" class="muted" style="align-self:center"></span>
+    </div>
+    <p class="muted small" style="margin:8px 0 0">Saving settings or prompts also makes them the starting point for every new project.
+      <button class="tiny secondary" id="btnUseDefaults" disabled title="Replace this project's models, token cap, prompts and options with your saved defaults">Use my saved defaults in this project</button></p>
+  </div>
+  <div id="fpOverlay"><div id="fpBox">
+    <div class="inline" id="fpPath"><button class="secondary tiny" id="fpUp" type="button" title="Up one folder">&uarr; Up</button>
+      <button class="secondary tiny" id="fpHome" type="button">Home</button><input id="fpCur" type="text">
+      <label style="margin:0;text-transform:none;white-space:nowrap"><input type="checkbox" id="fpHidden"> hidden</label></div>
+    <div id="fpList"></div>
+    <div class="row" style="margin-top:10px"><button id="fpUse" type="button">Use this folder</button>
+      <button class="secondary" id="fpCancel" type="button">Cancel</button><span id="fpNote" class="muted small" style="align-self:center"></span></div>
+  </div></div>
+
+  <div class="card" id="modelsCard" style="display:none">
+    <h2>2. Models</h2>
+    <div id="nexusBox" class="nexusbox"></div>
+    <p class="muted small">Each phase can use its own model. Pick a model file and this tool starts it when it's needed and stops it when
+      it switches to another, so a run can go 9B &rarr; long-context &rarr; 27B unattended without them all having to fit in RAM at once.
+      A server you started yourself (in the launcher) can be used too, but this tool can't unload it.</p>
+    <div id="modelRows"></div>
+    <div class="checks">
+      <label><input type="checkbox" id="optAutoFinal"> Run the final pass automatically when the chunks finish</label>
+      <label><input type="checkbox" id="optUnloadSwitch"> Swap models one at a time (off = models stay loaded side by side, except ones marked "run alone")</label>
+      <label><input type="checkbox" id="optUnloadEnd"> Stop models this tool started when a run finishes</label>
+      <label><input type="checkbox" id="optKeepFinal"> ...but keep the final-pass model loaded after a final pass, so it can answer follow-up questions (it still remembers the final pass)</label>
+      <label><input type="checkbox" id="optAutosave"> Save a snapshot automatically when a run finishes</label>
+    </div>
+    <div class="row" style="margin-top:10px"><button id="btnSaveSettings">Save settings</button><span id="settingsStatus" class="muted" style="align-self:center"></span></div>
+  </div>
+
+  <div class="card" id="scanCard" style="display:none">
+    <h2>3. Scan result</h2>
+    <div id="scanSummary" class="muted"></div>
+    <div id="oversizedBox"></div>
+  </div>
+
+  <div class="card" id="promptsCard" style="display:none">
+    <h2>4. Per-chunk prompt chain <span class="hint">(runs in order on every chunk; every answer is kept -- for a one-shot sweep, leave just one prompt)</span></h2>
+    <div class="libbar" data-kind="chunk"></div>
+    <div id="chunkPrompts"></div>
+    <button class="secondary" id="addChunkPrompt">+ Add prompt</button>
+    <h2>Final-pass prompt chain <span class="hint">(optional -- only used by step 6)</span></h2>
+    <div class="libbar" data-kind="final"></div>
+    <div id="finalPrompts"></div>
+    <button class="secondary" id="addFinalPrompt">+ Add prompt</button>
+    <div class="row" style="margin-top:12px"><button id="btnSavePrompts">Save prompts</button><span id="promptsStatus" class="muted" style="align-self:center"></span></div>
+  </div>
+
+  <div class="card" id="buildCard" style="display:none">
+    <h2>5. Chunks</h2>
+    <div class="btnrow">
+      <button id="btnBuildChunks" class="secondary">Build chunks from current files</button>
+      <button id="btnRun" disabled>Run</button>
+      <button id="btnStopAfter" class="secondary" disabled>Stop after this chunk</button>
+      <button id="btnStopNow" class="danger" disabled>Stop now</button>
+      <span class="spacer"></span>
+      <button id="btnSnapshot" class="secondary">Save snapshot</button>
+      <button id="btnExportAll" class="secondary">Export all (.md)</button>
+      <button id="btnCopyAll" class="secondary">Copy all</button>
+    </div>
+    <p class="muted small" style="margin:6px 0 0">Changes to models and prompts take effect from the next chunk, even during a run (press Save settings / Save prompts):
+      a model this tool started is restarted with the new settings before its next chunk. To redo work: "Restart with current settings" on the running chunk,
+      Reset on one chunk, or <button class="tiny secondary" id="btnRerunMain" type="button">Re-run all chunk-model chunks</button>
+      <button class="tiny secondary" id="btnRerunLarge" type="button">Re-run all large-context chunks</button> -- reset chunks are picked up by a run that is still going.</p>
+    <div id="phaseMsg" class="phase" style="display:none"></div>
+    <div id="chunkSummary" class="muted" style="margin-top:8px"></div>
+    <div id="chunkList" style="margin-top:10px"></div>
+    <div class="log" id="runLog" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card" id="finalCard" style="display:none">
+    <h2>6. Final pass <span class="hint">(optional -- skip it if the per-chunk results are all you need)</span></h2>
+    <div class="btnrow">
+      <button id="btnBuildFinal" class="secondary">Build final chunk(s) from the results</button>
+      <button id="btnFinalRun" disabled>Run final pass</button>
+      <button id="btnFinalStop" class="danger" disabled>Stop now</button>
+      <span class="spacer"></span>
+      <button id="btnExportFinal" class="secondary">Export final (.md)</button>
+    </div>
+    <div id="finalSummary" class="muted" style="margin-top:8px"></div>
+    <div id="finalList" style="margin-top:10px"></div>
+    <div id="fuBox" style="display:none">
+      <h3 style="margin:0 0 4px">Follow-up with the final-pass model</h3>
+      <p class="muted small" id="fuInfo" style="margin:0 0 6px"></p>
+      <div id="fuTurns"></div>
+      <div id="fuLive" class="fu-turn" style="display:none"><div class="who"><span>Final model</span><span id="fuLiveStat" class="small"></span></div><div class="body" id="fuLiveText"></div></div>
+      <textarea id="fuText" rows="4" placeholder="Ask it anything about the report -- e.g. &quot;Which files do you need to check the shell-injection claim?&quot;, then attach them and ask it to verify. Drop files here too."></textarea>
+      <div class="fu-files" id="fuFiles"></div>
+      <div class="btnrow">
+        <input type="file" id="fuFile" multiple style="display:none">
+        <button class="secondary tiny" id="fuAttach" type="button">Attach files...</button>
+        <input id="fuProjFile" list="fuProjList" placeholder="add a project file (type to search)" style="max-width:320px">
+        <datalist id="fuProjList"></datalist>
+        <span class="spacer"></span>
+        <label class="small" style="margin:0;text-transform:none" title="Only needed if the model forgot the conversation (restarted, or used by something else) and there is no saved memory: it reads the final chunk and every turn again"><input type="checkbox" id="fuReread"> read it all again</label>
+        <button id="fuSend" type="button">Send</button>
+        <button class="danger tiny" id="fuStop" type="button" style="display:none">Stop</button>
+        <button class="secondary" id="fuSaveText" type="button" title="Saves this report with the follow-up conversation (text only, no model memory). Each answer is also saved automatically.">Save report</button>
+        <button class="secondary" id="fuSave" type="button" title="Saves this report (with the follow-up conversation) AND the final model's memory, so you can pick the conversation up later without re-reading anything">Save report with final KV</button>
+      </div>
+      <div id="fuErr"></div>
+    </div>
+  </div>
+</div>
+<script>
+let ROOT = null;
+let ST = null;            // last project state from the server
+let liveState = {};       // what's streaming right now
+let VIEW = null;          // saved report being viewed
+const $ = (s) => document.querySelector(s);
+const ROUTES = [
+  ["main", "Chunk model", "Runs every normal chunk, split parts and forced over-cap files."],
+  ["large", "Large-context model", "Only for oversized files you send to it. Leave the URL empty if you don't use one."],
+  ["final", "Final-pass model", "Reviews all the chunk results. Leave the URL empty to use the chunk model."],
+];
+
+function api(path, body) {
+  return fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                      body: JSON.stringify(Object.assign({root: ROOT}, body || {}))})
+    .then(r => r.json().then(j => { if (!r.ok) throw new Error(j.error || r.statusText); return j; }));
+}
+function getJSON(url) { return fetch(url).then(r => r.json().then(j => { if (!r.ok) throw new Error(j.error || r.statusText); return j; })); }
+function esc(s) { return (s + '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function flash(sel, msg) { const e = $(sel); e.textContent = msg; clearTimeout(e._t); e._t = setTimeout(() => e.textContent = '', 3000); }
+function fmtDate(t) { return t ? new Date(t * 1000).toLocaleString() : ''; }
+function fmtDur(a, b) { if (!a || !b) return ''; const s = Math.round(b - a); return s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm'; }
+function baseName(p) { return (p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'project'; }
+
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {
+    const ta = el('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  if (btn) { if (!btn.dataset.label) btn.dataset.label = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = btn.dataset.label, 1200); }
+}
+function download(name, text) {
+  const a = el('a'); a.href = URL.createObjectURL(new Blob([text], {type: 'text/markdown'})); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+// ------------------------------------------------------------------------------------------- markdown export
+function membersLine(c, kind) {
+  if (kind === 'final') return (c.members || []).map(m => m.chunk_id).join(', ');
+  return (c.members || []).map(m => m.path + (m.lines ? ` (part ${m.part}/${m.parts}, lines ${m.lines[0]}-${m.lines[1]})` : '')).join(', ');
+}
+function quote(s) { return (s || '').split('\n').map(l => '> ' + l).join('\n'); }
+function itemMD(c, kind) {
+  let s = `## ${c.id} -- ${c.status}${c.stop_reason === 'chunk' ? ' (skipped)' : ''}\n\n`;
+  s += `**${kind === 'final' ? 'From chunk results' : 'Files'}:** ${membersLine(c, kind)}  \n`;
+  s += `**Tokens:** ${(c.tokens || 0).toLocaleString()}` + (c.model ? `  \n**Model:** ${c.model}` : '') + '\n\n';
+  if (c.error) s += `**Error:** ${c.error}\n\n`;
+  (c.steps || []).forEach((st, i) => {
+    s += `### Step ${i + 1}\n\n`;
+    if (st.prompt) s += quote(st.prompt) + '\n\n';
+    s += (st.text || '').trim() + '\n\n';
+    if (st.truncated) s += `*[cut off at the ${st.truncated}-token output limit]*\n\n`;
+    if (st.stopped) s += `*[stopped by hand]*\n\n`;
+    if (st.notice) s += `*[server notice: ${st.notice}]*\n\n`;
+  });
+  if (!(c.steps || []).length) s += '*(no output)*\n\n';
+  return s;
+}
+function reportMD(state, which) {
+  let s = `# Nexus Code Hardening report\n\n**Project:** ${state.root}  \n**Exported:** ${new Date().toLocaleString()}\n\n`;
+  if (which !== 'final') {
+    s += `# Chunk results\n\n`;
+    (state.chunks || []).forEach(c => s += itemMD(c, 'chunk'));
+  }
+  if ((state.final_chunks || []).length) {
+    s += `# Final pass\n\n`;
+    state.final_chunks.forEach(c => s += itemMD(c, 'final'));
+  } else if (which === 'final') s += '*(no final pass has been built)*\n';
+  return s;
+}
+function fileStamp(state, which) { return `nexus-harden-${baseName(state.root)}-${which}-${new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')}.md`; }
+
+// ------------------------------------------------------------------------------------------- saved reports
+async function loadSaves() {
+  const box = $('#savesList');
+  try {
+    const r = await getJSON('/api/saves');
+    box.innerHTML = '';
+    if (!r.saves.length) { box.textContent = 'No saved reports yet. Snapshots are taken when a run finishes, or with "Save snapshot".'; return; }
+    const t = el('table', 'list');
+    t.innerHTML = '<tr><th>Name</th><th>Project</th><th>Saved</th><th>Chunks</th><th>Final</th><th></th></tr>';
+    for (const m of r.saves) {
+      const tr = el('tr');
+      tr.innerHTML = `<td>${esc(m.name)}</td><td class="mono small">${esc(m.root)}</td><td class="small">${esc(fmtDate(m.created))}</td>
+        <td>${m.chunks_done}/${m.chunks}</td><td>${m.final ? m.final_done + '/' + m.final : '-'}</td><td class="btnrow nowrap"></td>`;
+      const cell = tr.lastElementChild;
+      if (m.followup_turns) tr.firstElementChild.appendChild(el('span', 'pill', ` ${m.followup_turns} follow-up${m.followup_turns === 1 ? '' : 's'}`));
+      if (m.kv) tr.firstElementChild.innerHTML += ' <span class="pill" title="includes the final model\'s memory: View, then Continue this conversation">+ model memory</span>';
+      const bv = el('button', 'secondary tiny', 'View'); bv.onclick = () => viewSave(m.id);
+      const be = el('button', 'secondary tiny', 'Export'); be.onclick = async () => { const d = await getJSON('/api/saves/get?id=' + encodeURIComponent(m.id)); download(fileStamp(d, 'all'), reportMD(d, 'all')); };
+      const bd = el('button', 'danger secondary tiny', 'Delete'); bd.onclick = async () => { if (!confirm(`Delete saved report "${m.name}"?`)) return; await api('/api/saves/delete', {id: m.id}); if (VIEW && VIEW.meta && VIEW.meta.id === m.id) closeViewer(); loadSaves(); };
+      cell.append(bv, be, bd);
+      t.appendChild(tr);
+    }
+    box.appendChild(t);
+  } catch (e) { box.textContent = 'error: ' + e.message; }
+}
+async function viewSave(id) {
+  VIEW = await getJSON('/api/saves/get?id=' + encodeURIComponent(id));
+  $('#viewerCard').style.display = '';
+  $('#viewerTitle').textContent = 'Saved report: ' + (VIEW.meta ? VIEW.meta.name : id);
+  $('#viewerMeta').textContent = `${VIEW.root} -- saved ${fmtDate(VIEW.meta && VIEW.meta.created)} -- read-only`;
+  $('#viewerChunks').innerHTML = ''; $('#viewerFinal').innerHTML = '';
+  renderRunList($('#viewerChunks'), VIEW.chunks || [], 'chunk', {readonly: true});
+  renderRunList($('#viewerFinal'), VIEW.final_chunks || [], 'final', {readonly: true});
+  $('#viewerFinalHdr').style.display = (VIEW.final_chunks || []).length ? '' : 'none';
+  const vf = VIEW.followup;
+  $('#viewerFu').style.display = vf ? '' : 'none';
+  if (vf) {
+    fuRenderTurns($('#viewerFuTurns'), vf.turns || []);
+    $('#vResume').style.display = '';
+    $('#vResumeNote').textContent = vf.kv ? `model memory: ${vf.kv.path} (${(vf.kv.ctx || 0).toLocaleString()} tokens) -- loads it into the final-pass model`
+                                          : 'no model memory saved -- your next message has the final model read the report and this conversation again first';
+  }
+  $('#viewerCard').scrollIntoView({behavior: 'smooth'});
+}
+$('#vResume').onclick = async () => {
+  if (!VIEW || !VIEW.meta) return;
+  if (!ROOT || ROOT !== VIEW.root) { $('#root').value = VIEW.root; await $('#btnLoad').onclick(); }
+  $('#vResumeNote').textContent = 'loading the saved memory into the final-pass model (starts it if needed)...';
+  try { await api('/api/followup/resume', {id: VIEW.meta.id}); closeViewer(); await pollRun(); $('#fuBox').scrollIntoView({behavior: 'smooth'}); }
+  catch (e) { $('#vResumeNote').textContent = 'error: ' + e.message; }
+};
+function closeViewer() { VIEW = null; $('#viewerCard').style.display = 'none'; }
+$('#vClose').onclick = closeViewer;
+$('#vExportAll').onclick = () => VIEW && download(fileStamp(VIEW, 'all'), reportMD(VIEW, 'all'));
+$('#vExportFinal').onclick = () => VIEW && download(fileStamp(VIEW, 'final'), reportMD(VIEW, 'final'));
+$('#btnRefreshSaves').onclick = loadSaves;
+
+// ------------------------------------------------------------------------------------------- project
+$('#btnLoad').onclick = async () => {
+  ROOT = $('#root').value.trim();
+  if (!ROOT) { alert('enter a folder path'); return; }
+  try {
+    if (!NX) await loadNexus(false);
+    const st = await api('/api/project', {});
+    ST = st;
+    try { localStorage.setItem('harden_root', ROOT); } catch (e) {}
+    $('#cap').value = st.cap_tokens; $('#capLarge').value = st.large_cap_tokens || 250000;
+    $('#projStatus').textContent = `loaded. ${st.file_count} file(s) from a previous scan, ${st.chunks.length} chunk(s) built.`;
+    $('#btnScan').disabled = false; $('#btnDeleteProject').disabled = false; $('#btnUseDefaults').disabled = !(LIB && LIB.has_defaults);
+    loadLibrary();
+    renderModels(st); renderPrompts(st.chunk_prompts, st.final_prompts);
+    ['#modelsCard', '#promptsCard', '#buildCard'].forEach(s => $(s).style.display = '');
+    $('#chunkList').innerHTML = ''; $('#finalList').innerHTML = '';
+    if (st.file_count) { $('#scanCard').style.display = ''; $('#scanSummary').textContent = `${st.file_count} file(s) from the last scan.`; renderOversized(st.oversized); }
+    pollRun();
+  } catch (e) { $('#projStatus').textContent = 'error: ' + e.message; }
+};
+$('#btnScan').onclick = async () => {
+  $('#projStatus').textContent = 'scanning and tokenizing with the chunk model (one real tokenizer call per file; a big tree takes a while)...';
+  try {
+    await saveSettings(true);
+    const r = await api('/api/scan', {});
+    $('#scanCard').style.display = '';
+    $('#scanSummary').textContent = `${r.file_count} file(s), ${r.total_tokens.toLocaleString()} tokens total` + (r.context_size ? `. Chunk model context: ${r.context_size.toLocaleString()} tokens.` : '.');
+    renderOversized(r.oversized);
+    $('#projStatus').textContent = 'scan done.';
+  } catch (e) { $('#projStatus').textContent = 'error: ' + e.message; }
+};
+$('#btnDeleteProject').onclick = async () => {
+  if (!confirm(`Delete this tool's working data (scan, chunks, results, log) for:\n${ROOT}\n\nYour source files are never touched, and saved snapshots are kept.`)) return;
+  try { await api('/api/project/delete', {}); location.reload(); } catch (e) { alert('error: ' + e.message); }
+};
+
+// ------------------------------------------------------------------------------------------- models / settings
+let NX = null;   // what the server found: Nexus folder, server program, model files, graphics cards, launcher roster
+async function loadNexus(refresh) {
+  try { NX = await getJSON('/api/nexus' + (refresh ? '?refresh=1' : '')); } catch (e) { NX = {found: false, error: e.message, models: [], gpus: [], roster: [], looked_in: []}; }
+  renderNexus();
+  return NX;
+}
+function renderNexus() {
+  const b = $('#nexusBox'); if (!b) return;
+  if (NX.found) {
+    const g = NX.gpus.length ? NX.gpus.map(x => x.name + (x.vram_mb ? ` (${(x.vram_mb / 1024).toFixed(1)} GB)` : '')).join(', ') : 'none found';
+    b.className = 'nexusbox ok';
+    b.innerHTML = `Nexus found in <span class="mono">${esc(NX.dir)}</span> -- ${NX.models.length} model file(s), graphics: ${esc(g)}, ${NX.cores} CPU cores.`
+      + (NX.probe_error ? `<br><span class="amber">${esc(NX.probe_error)} -- graphics cards couldn't be listed; CPU-only still works.</span>` : '')
+      + ` <button class="secondary tiny" id="nxRefresh">Refresh</button>`;
+  } else {
+    b.className = 'nexusbox bad';
+    b.innerHTML = `<b>The Nexus server program (nexus_server) wasn't found.</b> Put this tool's folder next to the launcher -- for example
+      <span class="mono">&lt;launcher folder&gt;/harden/</span> -- so it can find the server, your models and your graphics cards.
+      You can still point it at servers that are already running.<br><span class="small muted">Looked in: ${NX.looked_in.map(esc).join(' &middot; ')}</span>
+      <div class="row" style="margin-top:8px"><div><label>Or type the folder the launcher is in</label><input id="nxDir" type="text" placeholder="/path/to/nexus"></div>
+      <button class="secondary" id="nxUse">Use this folder</button> <button class="secondary" id="nxRefresh">Look again</button></div>`;
+    $('#nxUse').onclick = async () => {
+      try { NX = await api('/api/nexus/dir', {dir: $('#nxDir').value.trim()}); renderNexus(); if (ST) renderModels(ST); } catch (e) { alert(e.message); }
+    };
+  }
+  $('#nxRefresh').onclick = async () => { b.innerHTML = 'looking (re-running the hardware probe)...'; await loadNexus(true); if (ST) { await saveSettings(true); renderModels(ST); } };
+}
+function showNexusNote() {
+  if (NX && !NX.found && !sessionStorageGet('nxNoteDismissed')) $('#nxNote').style.display = '';
+}
+function sessionStorageGet(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+
+const SAMPLING = [['temp', 'Temperature'], ['top_p', 'Top P'], ['top_k', 'Top K'], ['min_p', 'Min P'], ['tfs_z', 'TFS Z'],
+                  ['rep', 'Repeat penalty'], ['rep_n', 'Repeat last N'], ['freq', 'Frequency penalty'], ['pres', 'Presence penalty']];
+function gb(bytes) { return (bytes / 1073741824).toFixed(1) + ' GB'; }
+
+function renderModels(st) {
+  const box = $('#modelRows'); box.innerHTML = '';
+  const nx = NX || {found: false, models: [], gpus: [], roster: []};
+  for (const [route, label, hint] of ROUTES) {
+    const m = st.models[route] || {};
+    const d = el('div', 'model'); d.dataset.route = route;
+    const fileOpts = nx.models.map(f => `<option value="${esc(f.path)}">${esc(f.name)} -- ${gb(f.size)} -- ${esc(f.dir)}</option>`).join('');
+    const gpuOpts = '<option value="cpu">CPU only</option>' + nx.gpus.map(g => `<option value="${esc(g.value)}">[${esc(g.value)}] ${esc(g.name)}${g.vram_mb ? ' -- ' + (g.vram_mb / 1024).toFixed(1) + ' GB' : ''}${g.integrated ? ' (integrated)' : ''}${g.usable ? '' : ' (probe says not usable' + (g.reason ? ': ' + esc(g.reason) : '') + ')'}</option>`).join('');
+    const rosterOpts = '<option value="">' + (nx.roster.length ? 'pick one...' : 'none running') + '</option>' + nx.roster.map(r => `<option value="${esc(r.url)}">${esc(r.name)} (${esc(r.url)})</option>`).join('');
+    d.innerHTML = `<div class="mhead"><b>${label}</b> <span class="muted small">${hint}</span></div>
+      <div class="row">
+        <div style="max-width:300px"><label>How to run it</label><select class="m-src">
+          <option value="file">Load a model file (this tool starts and stops it)</option>
+          <option value="url">Use a server that's already running</option>
+          <option value="custom">Custom launch command</option></select></div>
+        <div style="max-width:150px"><label>Thinking</label><select class="m-think"><option value="">server default</option><option value="off">off</option><option value="on">on</option></select></div>
+        <div style="max-width:150px"><label>Max output tokens</label><input class="m-max" type="number" min="0" step="100" placeholder="0 = no limit"></div>
+      </div>
+      <div class="sec sec-file">
+        <div class="row">
+          <div style="flex:3"><label>Model</label><select class="m-file"><option value="">${nx.found ? (nx.models.length ? 'pick a model...' : 'no model files found in the launcher\'s folders') : 'Nexus not found -- see above'}</option>${fileOpts}</select></div>
+          <div style="max-width:100px"><label>Port</label><input class="m-port" type="number" min="1" max="65535"></div>
+          <div style="max-width:100px"><label>Threads</label><input class="m-threads" type="number" min="0" placeholder="auto (${nx.cores || '?'})"></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div style="flex:2"><label>Graphics card</label><select class="m-gpu">${gpuOpts}</select></div>
+          <div style="max-width:190px"><label>Whole model on the card</label><select class="m-full"><option value="0">No</option><option value="1">Yes (full GPU)</option></select></div>
+          <div style="max-width:210px"><label>Prompt acceleration</label><select class="m-turbo"><option value="0">No</option><option value="1">Yes (turbo prefill)</option></select></div>
+        </div>
+        <div class="small m-gpunote"></div>
+        <details class="adv"><summary>Advanced</summary>
+          <div class="row">
+            <div style="max-width:200px"><label>RoPE layout</label><select class="m-rope"><option value="">From the model file</option><option value="interleaved">Interleaved</option><option value="half_split">Half-split</option></select></div>
+            <div style="max-width:230px"><label>Norm convention</label><select class="m-norm"><option value="">From the model file</option><option value="direct">Direct (x*w)</option><option value="zero_centered">Zero-centered (x*(1+w))</option></select></div>
+          </div>
+          <div class="muted small" style="margin-top:4px">Same as the launcher's Model behaviour settings. If a model answers with gibberish, try changing RoPE or Norm -- the model's log shows what was chosen.</div>
+          <div class="row" style="margin-top:6px"><div style="max-width:220px"><label>Chat format</label><input class="m-fmt" type="text" placeholder="auto (from the model file)"></div>
+            <div><label>Extra server arguments</label><input class="m-extra" type="text" placeholder="e.g. --mtp on"></div></div>
+          <label style="margin-top:8px">Command this tool will run</label><div class="mono small m-cmd cmdline"></div>
+        </details>
+      </div>
+      <div class="sec sec-url sec-custom">
+        <div class="row">
+          <div style="flex:2"><label>Server URL</label><input class="m-url" type="text" placeholder="${route === 'final' ? '(empty = use the chunk model)' : 'http://127.0.0.1:8080'}"></div>
+          <div class="only-url" style="max-width:260px"><label>Running in the launcher now</label><select class="m-roster">${rosterOpts}</select></div>
+          <div style="max-width:120px"><label>Model</label><select class="m-model"><option value="1">1</option><option value="2">2 (--model2)</option></select></div>
+        </div>
+        <div class="row" style="margin-top:6px"><div style="max-width:360px"><label title="Only for a server on ANOTHER computer that was given an API key in its launcher (Network card). Servers on this computer never need it.">API key (only if that server asks for one)</label>
+          <input class="m-key" type="password" autocomplete="off" placeholder="empty = none"></div></div>
+        <div class="only-url muted small" style="margin-top:4px">This tool can't stop a server it didn't start -- it stays loaded until you stop it in the launcher.</div>
+        <div class="only-custom row" style="margin-top:6px"><div><label>Launch command (run by the shell; this tool starts and stops it)</label>
+          <input class="m-launch" type="text" placeholder="/path/to/nexus_server --model /path/to/model.gguf --port 8081"></div></div>
+      </div>
+      <details class="adv"><summary>Sampling</summary>
+        <div class="sgrid">${SAMPLING.map(([k, l]) => `<div><label>${l}</label><input class="m-s" data-k="${k}" type="number" step="any"></div>`).join('')}</div>
+        <div class="btnrow" style="margin-top:6px"><button class="secondary tiny m-fromlauncher">Use the launcher's saved settings for this model</button><span class="muted small m-snote"></span></div>
+      </details>
+      <label class="inline"><input type="checkbox" class="m-excl"> Run this model alone -- stop every other model this tool started before loading it (for a model that needs all the RAM)</label>
+      <div class="btnrow" style="margin-top:6px"><button class="secondary tiny m-test">Test</button><button class="secondary tiny m-start">Start</button><button class="secondary tiny m-stop">Stop</button><span class="muted small m-status"></span></div>`;
+    const q = (c) => d.querySelector(c);
+    let src = m.source || 'url';
+    if (src === 'url' && (m.launch || '').trim()) src = 'custom';
+    if (src === 'url' && !(m.url || '').trim() && nx.found) src = 'file';
+    q('.m-src').value = src;
+    q('.m-think').value = m.think || ''; q('.m-max').value = m.max_out || '';
+    if (m.file && ![...q('.m-file').options].some(o => o.value === m.file)) q('.m-file').insertAdjacentHTML('beforeend', `<option value="${esc(m.file)}">${esc(m.file)} (not in the launcher's folders)</option>`);
+    q('.m-file').value = m.file || '';
+    q('.m-port').value = m.port || ({main: 8091, large: 8092, final: 8093})[route];
+    q('.m-threads').value = m.threads || '';
+    if (m.gpu && ![...q('.m-gpu').options].some(o => o.value === m.gpu)) q('.m-gpu').insertAdjacentHTML('beforeend', `<option value="${esc(m.gpu)}">card ${esc(m.gpu)} (not found by the probe)</option>`);
+    q('.m-gpu').value = m.gpu || 'cpu';
+    q('.m-full').value = m.full_gpu ? '1' : '0'; q('.m-turbo').value = m.turbo ? '1' : '0';
+    q('.m-fmt').value = m.chat_format || ''; q('.m-extra').value = m.extra_args || '';
+    q('.m-rope').value = m.rope || ''; q('.m-norm').value = m.norm || '';
+    q('.m-url').value = m.url || ''; q('.m-model').value = m.model || '1'; q('.m-key').value = m.api_key || ''; q('.m-launch').value = m.launch || '';
+    q('.m-excl').checked = !!m.exclusive;
+    const smp = m.sampling || {};
+    d.querySelectorAll('.m-s').forEach(i => i.value = smp[i.dataset.k] ?? '');
+
+    const fileInfo = () => nx.models.find(f => f.path === q('.m-file').value);
+    const applyLauncher = (quietIfNone) => {
+      const f = fileInfo(), n = q('.m-snote');
+      if (!f || !f.launcher) { if (!quietIfNone) n.textContent = 'the launcher has no saved settings for this model'; return; }
+      d.querySelectorAll('.m-s').forEach(i => { if (f.launcher.sampling[i.dataset.k] !== undefined) i.value = f.launcher.sampling[i.dataset.k]; });
+      if (f.launcher.chat_format) q('.m-fmt').value = f.launcher.chat_format;
+      q('.m-rope').value = f.launcher.rope || ''; q('.m-norm').value = f.launcher.norm || '';
+      n.textContent = 'filled in from the launcher\'s saved settings for ' + f.name;
+    };
+    const refresh = () => {
+      const s = q('.m-src').value;
+      d.querySelectorAll('.sec').forEach(x => x.style.display = x.classList.contains('sec-' + s) ? '' : 'none');
+      d.querySelectorAll('.only-url').forEach(x => x.style.display = s === 'url' ? '' : 'none');
+      d.querySelectorAll('.only-custom').forEach(x => x.style.display = s === 'custom' ? '' : 'none');
+      q('.m-fromlauncher').style.display = s === 'file' ? '' : 'none';
+      const cpu = q('.m-gpu').value === 'cpu', full = q('.m-full').value === '1';
+      q('.m-full').disabled = cpu; q('.m-turbo').disabled = cpu || full;
+      if (cpu) { q('.m-full').value = '0'; q('.m-turbo').value = '0'; }
+      if (full) q('.m-turbo').value = '0';
+      const g = nx.gpus.find(x => x.value === q('.m-gpu').value), f = fileInfo(), note = q('.m-gpunote'); let t = '', warn = false;
+      if (g && full && f && g.vram_mb) {
+        const need = f.size / 1048576 * 1.03 + 700;
+        if (g.vram_mb * 0.92 < need) { t = `This model (${gb(f.size)}) probably won't fit in ${g.name}'s ${(g.vram_mb / 1024).toFixed(1)} GB -- the engine will place what it can. For a model bigger than the card, "No" + prompt acceleration is usually faster.`; warn = true; }
+        else t = 'The whole model fits on this card.';
+      } else if (g && !full && q('.m-turbo').value === '1') {
+        t = 'The model runs on the CPU and this card speeds up reading the prompt -- needs only about one layer of video memory.';
+        if (g.integrated) { t += ' Note: integrated graphics gave wrong answers in the launcher\'s testing.'; warn = true; }
+      } else if (g && !full) t = 'With both set to No, the card isn\'t used at all.';
+      note.textContent = t; note.className = 'small m-gpunote ' + (warn ? 'amber' : 'muted');
+    };
+    let previewT = null;
+    const preview = () => { clearTimeout(previewT); previewT = setTimeout(async () => {
+      if (q('.m-src').value !== 'file' || !ROOT) return;
+      try { await saveSettings(true); const r = await getJSON(`/api/launch_preview?root=${encodeURIComponent(ROOT)}&route=${route}`); q('.m-cmd').textContent = r.error || r.command; }
+      catch (e) { q('.m-cmd').textContent = e.message; } }, 350); };
+    q('.m-src').onchange = () => { refresh(); preview(); };
+    q('.m-file').onchange = () => { applyLauncher(true); refresh(); preview(); };
+    ['.m-gpu', '.m-full', '.m-turbo', '.m-rope', '.m-norm'].forEach(c => q(c).onchange = () => { refresh(); preview(); });
+    ['.m-port', '.m-threads', '.m-fmt', '.m-extra'].forEach(c => q(c).oninput = preview);
+    d.querySelectorAll('.m-s').forEach(i => i.oninput = preview);
+    q('.m-roster').onchange = () => { if (q('.m-roster').value) q('.m-url').value = q('.m-roster').value; };
+    q('.m-fromlauncher').onclick = () => { applyLauncher(false); preview(); };
+    q('.m-test').onclick = async () => {
+      const s = q('.m-status');
+      let url = q('.m-src').value === 'file' ? (q('.m-file').value ? 'http://127.0.0.1:' + q('.m-port').value : '') : q('.m-url').value.trim();
+      let model = q('.m-src').value === 'file' ? '1' : q('.m-model').value;
+      if (!url && route === 'final') { const mr = $('.model[data-route="main"]'); url = mr.querySelector('.m-src').value === 'file' ? 'http://127.0.0.1:' + mr.querySelector('.m-port').value : mr.querySelector('.m-url').value.trim(); }
+      if (!url) { s.textContent = 'nothing set up yet'; return; }
+      s.textContent = 'testing...';
+      const api_key = q('.m-src').value === 'file' ? '' : q('.m-key').value.trim();
+      try { const r = await api('/api/model/test', {url, model, api_key}); s.textContent = `up -- ${r.info.name || r.info.model || 'model'}${r.context_size ? ', context ' + r.context_size.toLocaleString() + ' tokens' : ''}`; }
+      catch (e) { s.textContent = /needs (its|an) API key|HTTP 401/i.test(e.message) ? 'reachable, but it needs its API key (wrong or missing)' : 'not running / not reachable'; }
+    };
+    q('.m-start').onclick = async () => {
+      const s = q('.m-status');
+      try { await saveSettings(true); const r = await api('/api/model/start', {route}); s.textContent = r.note || 'starting (pid ' + r.pid + ') -- press Test to see when it has loaded'; pollRun(); }
+      catch (e) { s.textContent = e.message; }
+    };
+    q('.m-stop').onclick = async () => {
+      const s = q('.m-status');
+      try { await api('/api/model/stop', {route}); s.textContent = 'stopped (only models this tool started can be stopped here)'; pollRun(); }
+      catch (e) { s.textContent = e.message; }
+    };
+    box.appendChild(d);
+    refresh();
+    if (src === 'file') preview();
+  }
+  $('#optAutoFinal').checked = !!st.auto_final;
+  $('#optUnloadSwitch').checked = st.unload_on_switch !== false;
+  $('#optUnloadEnd').checked = st.unload_at_end !== false;
+  $('#optKeepFinal').checked = st.keep_final_loaded !== false;
+  $('#optAutosave').checked = st.autosave !== false;
+}
+function collectSettings() {
+  const models = {};
+  document.querySelectorAll('#modelRows .model').forEach(d => {
+    const q = (c) => d.querySelector(c);
+    const sampling = {}; d.querySelectorAll('.m-s').forEach(i => { if (i.value.trim() !== '') sampling[i.dataset.k] = i.value.trim(); });
+    models[d.dataset.route] = {source: q('.m-src').value, url: q('.m-url').value.trim(), model: q('.m-model').value, api_key: q('.m-key').value.trim(),
+      launch: q('.m-launch').value.trim(), file: q('.m-file').value, port: parseInt(q('.m-port').value || '0', 10) || 0,
+      threads: parseInt(q('.m-threads').value || '0', 10) || 0, gpu: q('.m-gpu').value || 'cpu',
+      full_gpu: q('.m-full').value === '1', turbo: q('.m-turbo').value === '1', chat_format: q('.m-fmt').value.trim(),
+      extra_args: q('.m-extra').value.trim(), rope: q('.m-rope').value, norm: q('.m-norm').value, think: q('.m-think').value, max_out: parseInt(q('.m-max').value || '0', 10) || 0,
+      exclusive: q('.m-excl').checked, sampling};
+  });
+  return {models, cap_tokens: parseInt($('#cap').value, 10) || 150000, large_cap_tokens: parseInt($('#capLarge').value, 10) || 250000,
+    auto_final: $('#optAutoFinal').checked, unload_on_switch: $('#optUnloadSwitch').checked,
+    unload_at_end: $('#optUnloadEnd').checked, keep_final_loaded: $('#optKeepFinal').checked, autosave: $('#optAutosave').checked,
+    chunk_prompts: [...document.querySelectorAll('#chunkPrompts textarea')].map(t => t.value),
+    final_prompts: [...document.querySelectorAll('#finalPrompts textarea')].map(t => t.value)};
+}
+async function saveSettings(quiet) {
+  if (!ROOT || !$('#modelRows .model')) return;
+  await api('/api/settings', collectSettings());
+  if (!quiet) flash('#settingsStatus', 'saved');
+}
+$('#btnSaveSettings').onclick = async () => { try { await saveSettings(false); } catch (e) { flash('#settingsStatus', 'error: ' + e.message); } };
+$('#btnSavePrompts').onclick = async () => { try { await saveSettings(true); flash('#promptsStatus', 'saved'); } catch (e) { flash('#promptsStatus', 'error: ' + e.message); } };
+function renderManaged(st) {
+  document.querySelectorAll('#modelRows .model').forEach(d => {
+    const m = (st.model_status || {})[d.dataset.route];
+    d.classList.toggle('managed-alive', !!(m && m.alive));
+    let tag = d.querySelector('.m-proc'); if (!tag) { tag = el('span', 'pill m-proc'); d.querySelector('.mhead').appendChild(tag); }
+    tag.style.display = m ? '' : 'none';
+    if (m) { tag.className = 'pill m-proc ' + (m.alive ? 'done' : 'error'); tag.textContent = m.alive ? 'loaded by this tool, pid ' + m.pid : 'exited -- see ' + m.log; tag.title = m.log; }
+  });
+}
+
+// ------------------------------------------------------------------------------------------- scan / prompts
+function renderOversized(list) {
+  const ob = $('#oversizedBox'); ob.innerHTML = '';
+  if (!list || !list.length) return;
+  ob.appendChild(el('p', 'amber', `${list.length} file(s) alone exceed the token cap. Choose what to do with each, then build chunks:`));
+  const t = el('table', 'list');
+  t.innerHTML = '<tr><th>File</th><th>Tokens</th><th>What to do</th></tr>';
+  for (const o of list) {
+    const tr = el('tr');
+    tr.append(el('td', 'mono', o.path), el('td', '', o.tokens.toLocaleString()));
+    const td = el('td'), sel = el('select');
+    [['exclude', 'Exclude it'], ['split', 'Split into parts for the chunk model'], ['split_large', 'Split into parts for the large-context model'],
+     ['large', 'Run it whole on the large-context model'],
+     ['force', 'Force it on the chunk model as its own over-cap chunk']].forEach(([v, l]) => { const op = el('option', '', l); op.value = v; sel.appendChild(op); });
+    sel.value = o.decision || 'exclude';
+    sel.onchange = async () => { try { await api('/api/oversized_decision', {path: o.path, decision: sel.value}); } catch (e) { alert(e.message); } };
+    td.appendChild(sel); tr.appendChild(td); t.appendChild(tr);
+  }
+  ob.appendChild(t);
+  ob.appendChild(el('p', 'muted small', 'Split cuts a file into line ranges that each fit a cap -- the chunk cap, or the large-context cap for '
+    + '"split for the large-context model" (so a 300k file with a 250k large cap becomes 2 parts, not 4). Fine for sweeps like comments/notes/personal info; '
+    + 'a single part can\'t see the rest of its file. Large-context work runs after every normal chunk, once the tool has switched models.'));
+}
+function promptRow(container, value) {
+  const row = el('div', 'prompt-item');
+  row.innerHTML = `<div class="num"></div><textarea></textarea><button class="secondary" title="remove">x</button>`;
+  row.querySelector('textarea').value = value;
+  row.querySelector('button').onclick = () => { row.remove(); renumber(container); };
+  container.appendChild(row); renumber(container);
+}
+function renumber(container) { [...container.children].forEach((r, i) => r.querySelector('.num').textContent = (i + 1) + '.'); }
+function renderPrompts(cp, fp) {
+  $('#chunkPrompts').innerHTML = ''; cp.forEach(p => promptRow($('#chunkPrompts'), p));
+  $('#finalPrompts').innerHTML = ''; fp.forEach(p => promptRow($('#finalPrompts'), p));
+}
+$('#addChunkPrompt').onclick = () => promptRow($('#chunkPrompts'), '');
+
+// ------------------------------------------------------------------------------------------- library: recent projects, saved prompt chains, defaults
+let LIB = null;
+async function loadLibrary() {
+  try { LIB = await getJSON('/api/library'); } catch (e) { return; }
+  const rs = $('#recent');
+  rs.innerHTML = '<option value="">Recent projects...</option>';
+  (LIB.recent || []).forEach(r => { const o = el('option', '', r); o.value = r; rs.appendChild(o); });
+  rs.style.display = (LIB.recent || []).length ? '' : 'none';
+  document.querySelectorAll('.libbar').forEach(renderLibBar);
+  if (ROOT && ST) $('#btnUseDefaults').disabled = !LIB.has_defaults;
+}
+$('#recent').onchange = () => { const v = $('#recent').value; if (v) { $('#root').value = v; $('#recent').value = ''; $('#btnLoad').click(); } };
+function chainBox(kind) { return kind === 'chunk' ? $('#chunkPrompts') : $('#finalPrompts'); }
+function chainValues(kind) { return [...chainBox(kind).querySelectorAll('textarea')].map(t => t.value).filter(v => v.trim()); }
+function renderLibBar(bar) {
+  const kind = bar.dataset.kind, sets = ((LIB && LIB.prompt_sets) || {})[kind] || [];
+  bar.innerHTML = '';
+  const sel = el('select'); sel.appendChild(Object.assign(el('option', '', 'Saved prompt chains...'), {value: ''}));
+  sets.forEach((x, i) => { const o = el('option', '', `${x.name}  (${x.prompts.length} prompt${x.prompts.length === 1 ? '' : 's'})`); o.value = i; sel.appendChild(o); });
+  const load = el('button', 'tiny', 'Load'), save = el('button', 'tiny secondary', 'Save as...'), del = el('button', 'tiny secondary', 'Delete');
+  load.type = save.type = del.type = 'button';
+  const pick = () => sel.value === '' ? null : sets[+sel.value];
+  const sync = () => { const x = pick(); load.disabled = !x; del.disabled = !x || x.builtin; };
+  sel.onchange = sync; sync();
+  load.onclick = () => {
+    const x = pick(); if (!x) return;
+    const cur = chainValues(kind);
+    if (cur.length && JSON.stringify(cur) !== JSON.stringify(x.prompts) && !confirm(`Replace the ${cur.length} prompt(s) here with "${x.name}"?`)) return;
+    const box = chainBox(kind); box.innerHTML = ''; x.prompts.forEach(p => promptRow(box, p));
+    saveSettings(true).then(() => flash('#promptsStatus', `loaded "${x.name}" and saved`)).catch(() => {});
+  };
+  save.onclick = async () => {
+    const prompts = chainValues(kind);
+    if (!prompts.length) { alert('the chain is empty'); return; }
+    const x = pick();
+    const name = (prompt('Name for this prompt chain:', x && !x.builtin ? x.name : '') || '').trim();
+    if (!name) return;
+    if (sets.some(s => s.name === name && !s.builtin) && !confirm(`Overwrite the saved chain "${name}"?`)) return;
+    try { const r = await api('/api/prompt_sets/save', {kind, name, prompts}); LIB.prompt_sets = r.sets; renderLibBar(bar);
+          flash('#promptsStatus', `saved "${name}"`); } catch (e) { alert(e.message); }
+  };
+  del.onclick = async () => {
+    const x = pick(); if (!x || x.builtin || !confirm(`Delete the saved chain "${x.name}"?`)) return;
+    try { const r = await api('/api/prompt_sets/delete', {kind, name: x.name}); LIB.prompt_sets = r.sets; renderLibBar(bar); } catch (e) { alert(e.message); }
+  };
+  bar.append(sel, load, save, del);
+}
+$('#btnUseDefaults').onclick = async () => {
+  if (!confirm('Replace this project\'s models, token cap, prompts and options with your saved defaults? (Scan results, chunks and results are kept.)')) return;
+  try { await api('/api/defaults/apply', {}); $('#btnLoad').click(); flash('#projStatus', 'saved defaults applied'); } catch (e) { alert(e.message); }
+};
+
+// ------------------------------------------------------------------------------------------- folder picker
+let FP = null;
+async function fpGo(path) {
+  try { FP = await getJSON('/api/browse?path=' + encodeURIComponent(path || '') + ($('#fpHidden').checked ? '&hidden=1' : '')); }
+  catch (e) { $('#fpNote').textContent = e.message; return; }
+  $('#fpCur').value = FP.path;
+  $('#fpNote').textContent = FP.error ? 'cannot read: ' + FP.error : (FP.is_project ? 'this folder already has a project' : '');
+  const list = $('#fpList'); list.innerHTML = '';
+  (FP.roots || []).forEach(r => { const d = el('div', '', r); d.onclick = () => fpGo(r); list.appendChild(d); });
+  if (!FP.dirs.length) list.appendChild(el('div', 'muted', '(no folders inside)'));
+  FP.dirs.forEach(n => {
+    const d = el('div', '', '\u{1F4C1} ' + n);
+    const full = FP.path.replace(/[\/\\]$/, '') + (FP.path.includes('\\') && !FP.path.includes('/') ? '\\' : '/') + n;
+    d.onclick = () => fpGo(full); d.title = full; list.appendChild(d);
+  });
+}
+$('#btnBrowse').onclick = () => { $('#fpOverlay').style.display = 'flex'; fpGo($('#root').value.trim()); };
+$('#fpUp').onclick = () => FP && FP.parent && fpGo(FP.parent);
+$('#fpHome').onclick = () => fpGo(FP ? FP.home : '');
+$('#fpHidden').onchange = () => fpGo(FP ? FP.path : '');
+$('#fpCur').onkeydown = (e) => { if (e.key === 'Enter') fpGo($('#fpCur').value.trim()); };
+$('#fpCancel').onclick = () => { $('#fpOverlay').style.display = 'none'; };
+$('#fpUse').onclick = () => { if (!FP) return; $('#root').value = FP.path; $('#fpOverlay').style.display = 'none'; $('#btnLoad').click(); };
+loadLibrary();
+$('#addFinalPrompt').onclick = () => promptRow($('#finalPrompts'), '');
+
+// ------------------------------------------------------------------------------------------- chunk lists
+// Builds each item's DOM once and patches it on every poll, so open/closed state and scroll position
+// inside a streaming box survive polling. Used for live lists and (readonly) for saved-report viewing.
+function renderRunList(container, items, kind, opts) {
+  opts = opts || {};
+  const listKey = kind === 'final' ? 'final_chunks' : 'chunks';
+  container._items = {};
+  const ids = items.map(c => c.id);
+  for (const c of items) {
+    container._items[c.id] = c;
+    const isLive = !opts.readonly && liveState.chunk_id === c.id && liveState.kind === kind;
+    let div = [...container.children].find(d => d.dataset.id === c.id);
+    if (!div) {
+      div = el('div', 'chunk runitem'); div.dataset.id = c.id;
+      div.innerHTML = `<div class="hdr">
+          <div class="hdrMain"><span class="caret"></span><b class="idlbl"></b><span class="pill st"></span><span class="tags"></span><span class="muted small metaline"></span></div>
+          <div class="hdrActions btnrow"></div></div>
+        <div class="files"></div><div class="muted small modelline"></div><div class="errbox" style="display:none"></div><div class="steps"></div>`;
+      div.querySelector('.idlbl').textContent = c.id;
+      div.querySelector('.hdr').addEventListener('click', (e) => { if (!e.target.closest('button')) div.classList.toggle('open'); });
+      const acts = div.querySelector('.hdrActions');
+      const btn = (cls, label, title, fn) => { const b = el('button', 'tiny ' + cls, label); if (title) b.title = title; b.onclick = (e) => { e.stopPropagation(); fn(b); }; acts.appendChild(b); return b; };
+      const act = async (body, confirmMsg) => { if (confirmMsg && !confirm(confirmMsg)) return; try { await api('/api/item', Object.assign({list: listKey, id: c.id}, body)); } catch (e) { alert(e.message); } pollRun(); };
+      if (!opts.readonly) {
+        btn('danger skipBtn', 'Stop & skip', 'Stop this chunk now (keeps what it wrote so far) and move on to the next one', () => act({action: 'skip'}));
+        btn('secondary restartBtn', 'Restart with current settings', 'Stop this chunk now and run it again from the start, with the model and prompts set right now (change them first, then press this)',
+            () => act({action: 'restart'}, `Stop ${c.id} and run it again with the current model and prompts? What it wrote so far is discarded.`));
+        btn('secondary', '↑', 'Move up the queue', () => act({action: 'move', dir: 'up'}));
+        btn('secondary', '↓', 'Move down the queue', () => act({action: 'move', dir: 'down'}));
+        if (kind === 'chunk') btn('secondary routeBtn', '', 'Which model runs this chunk', () => {
+          const cur = container._items[c.id]; act({action: 'route', route: cur.route === 'large' ? 'main' : 'large'}); });
+        btn('secondary resetBtn', 'Reset', 'Clear its output so it runs again', () => act({action: 'reset'}, `Reset ${c.id}? Its saved output is cleared so it runs again.`));
+        btn('danger secondary delBtn', 'Delete', 'Remove it from the queue', () => act({action: 'delete'}, `Delete ${c.id} from the queue?`));
+      }
+      btn('secondary', 'Copy', 'Copy every step of this item as markdown', (b) => copyText(itemMD(container._items[c.id], kind), b));
+      btn('secondary', 'Export', 'Download this item as a .md file', () => { const cur = container._items[c.id]; download(`${cur.id}.md`, itemMD(cur, kind)); });
+      container.appendChild(div);
+    }
+    const running = c.status === 'running';
+    const pill = div.querySelector('.pill.st'); pill.className = 'pill st ' + c.status;
+    pill.textContent = c.status === 'stopped' && c.stop_reason === 'chunk' ? 'skipped' : c.status;
+    const tags = [];
+    if (c.route === 'large') tags.push(['forced', 'large-context model']);
+    if (c.kind === 'split') tags.push(['split', 'split part']);
+    if (c.kind === 'forced') tags.push(['forced', 'over cap']);
+    if ((c.steps || []).some(s => s.truncated)) tags.push(['amber', 'hit output limit']);
+    div.querySelector('.tags').innerHTML = tags.map(([k, t]) => `<span class="pill ${k}">${t}</span>`).join('');
+    div.querySelector('.metaline').textContent = `${(c.tokens || 0).toLocaleString()} tok · ${(c.members || []).length} ${kind === 'final' ? 'chunk result(s)' : 'file(s)'}`
+      + (c.finished && c.started ? ' · took ' + fmtDur(c.started, c.finished) : '');
+    div.querySelector('.files').textContent = membersLine(c, kind);
+    div.querySelector('.modelline').textContent = c.model || '';
+    if (!opts.readonly) {
+      div.querySelector('.skipBtn').style.display = running ? '' : 'none';
+      { const rs = div.querySelector('.restartBtn'); if (rs) rs.style.display = running ? '' : 'none'; }
+      div.querySelector('.resetBtn').disabled = running; div.querySelector('.delBtn').disabled = running;
+      const rb = div.querySelector('.routeBtn');
+      if (rb) { rb.textContent = c.route === 'large' ? '→ chunk model' : '→ large-context'; rb.disabled = running; }
+    }
+    const errbox = div.querySelector('.errbox');
+    errbox.style.display = c.error ? '' : 'none';
+    if (c.error) errbox.textContent = 'Failed: ' + c.error + ((c.steps || []).length ? ' -- whatever it wrote before failing is below.' : '');
+    if (isLive && !div.dataset.autoopened) { div.classList.add('open'); div.dataset.autoopened = '1'; }
+    div.querySelector('.caret').textContent = div.classList.contains('open') ? '▾' : '▸';
+
+    const stepsBox = div.querySelector('.steps');
+    const done = c.steps || [];
+    const liveAns = isLive ? (liveState.answers || []) : [];
+    const total = isLive ? (liveState.prompt_total || 0) : done.length;
+    const count = Math.max(done.length, isLive ? liveAns.length + 1 : 0);
+    for (let i = 0; i < count; i++) {
+      let sd = [...stepsBox.children].find(x => +x.dataset.step === i);
+      if (!sd) {
+        sd = el('div', 'step'); sd.dataset.step = i;
+        sd.innerHTML = `<div class="stepHdr"><span class="stepNum"></span><span class="livedot" style="display:none"></span><span class="stepTags"></span>
+          <span class="spacer"></span><button class="tiny secondary cpBtn">Copy</button><button class="tiny secondary mdToggle">Render</button></div>
+          <div class="stepPrompt muted small"></div><pre class="stepBox"></pre>`;
+        sd.querySelector('.cpBtn').onclick = (e) => copyText(sd.querySelector('.stepBox').dataset.raw || '', e.target);
+        sd.querySelector('.mdToggle').onclick = () => {
+          const pre = sd.querySelector('.stepBox'), b = sd.querySelector('.mdToggle'), raw = pre.dataset.raw || '';
+          if (pre.dataset.mode === 'md') { pre.textContent = raw; pre.dataset.mode = 'raw'; b.textContent = 'Render'; }
+          else { pre.innerHTML = renderMD(partialMD(raw)); pre.dataset.mode = 'md'; b.textContent = 'Raw'; }
+        };
+        stepsBox.appendChild(sd);
+      }
+      const isThisLive = isLive && i === liveAns.length;
+      const step = done[i] || {};
+      const text = i < done.length ? (step.text || '') : (i < liveAns.length ? liveAns[i] : (liveState.text || ''));
+      sd.querySelector('.stepNum').textContent = `Step ${i + 1}${total ? '/' + total : ''}`;
+      const dot = sd.querySelector('.livedot');
+      dot.style.display = isThisLive ? '' : 'none';
+      if (isThisLive) dot.textContent = liveText(liveState);
+      const st = [];
+      if (step.memory === 'kept') st.push('<span class="pill" title="The model still held the chunk and its earlier answers: only this prompt was read">memory kept</span>');
+      else if (step.memory === 're-read') st.push('<span class="pill warn" title="The model had lost its memory of this chunk (restarted, or used by something else), so the chunk and earlier answers were read again">re-read</span>');
+      const spd = step.speed;
+      if (spd && (spd.prompt_tps || spd.out_tps))
+        st.push(`<span class="pill" title="prompt ${(spd.prompt_tokens || 0).toLocaleString()} tok, answer ${(spd.out_tokens || 0).toLocaleString()} tok${spd.first_token_s != null ? ', first word after ' + spd.first_token_s + ' s' : ''}">`
+                + (spd.prompt_tps ? `read ${spd.prompt_tps.toFixed(1)} tok/s` : '') + (spd.prompt_tps && spd.out_tps ? ' · ' : '')
+                + (spd.out_tps ? `wrote ${spd.out_tps.toFixed(1)} tok/s` : '') + `</span>`);
+      if (step.truncated) st.push(`<span class="pill amber">cut at ${step.truncated} tok</span>`);
+      if (step.stopped) st.push(`<span class="pill error">stopped</span>`);
+      if (step.notice) st.push(`<span class="pill amber" title="${esc(step.notice)}">server notice</span>`);
+      sd.querySelector('.stepTags').innerHTML = st.join('');
+      const p = step.prompt || '';
+      const pe = sd.querySelector('.stepPrompt'); pe.textContent = p ? 'Prompt: ' + (p.length > 160 ? p.slice(0, 160) + '...' : p) : ''; pe.title = p;
+      const pre = sd.querySelector('.stepBox');
+      if (pre.dataset.raw !== text) {
+        pre.dataset.raw = text;
+        // follow the text while you're at the bottom (raw AND rendered); scroll up and it stays where you put it
+        const nearBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 60;
+        if (pre.dataset.mode === 'md') pre.innerHTML = renderMD(partialMD(text));
+        else pre.textContent = text;
+        if (isThisLive && nearBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+    [...stepsBox.children].forEach(sd => { if (+sd.dataset.step >= count) sd.remove(); });
+  }
+  [...container.children].forEach(d => { if (!ids.includes(d.dataset.id)) d.remove(); });
+  const order = [...container.children].map(d => d.dataset.id);
+  if (order.join('\n') !== ids.join('\n')) ids.forEach(id => { const d = [...container.children].find(x => x.dataset.id === id); if (d) container.appendChild(d); });
+}
+
+function summarize(list) {
+  const n = {}; list.forEach(c => { const k = c.status === 'stopped' && c.stop_reason === 'chunk' ? 'skipped' : c.status; n[k] = (n[k] || 0) + 1; });
+  return Object.entries(n).map(([k, v]) => `${v} ${k}`).join(' · ');
+}
+
+// "● reading prompt 34% · 104.2 tok/s · about 9m 40s left"  /  "● writing · 120/1000 tok · 38.5 tok/s"
+function liveText(L) {
+  const S = L.stat || {}, fmt = (n) => (+n || 0).toFixed(1);
+  const eta = (s) => s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+  if (S.phase === 'reading')
+    return `● reading prompt ${Math.round(S.pct || 0)}% · ` + (S.prompt_tps > 0 ? `${fmt(S.prompt_tps)} tok/s` : 'measuring speed')
+         + (S.eta >= 0 ? ` · about ${eta(S.eta)} left` : '');
+  if (S.phase === 'writing' || (L.gen || 0) > 0)
+    return `● writing · ${L.gen || 0}${L.max_out ? '/' + L.max_out : ''} tok` + (S.out_tps > 0 ? ` · ${fmt(S.out_tps)} tok/s` : '')
+         + (S.prompt_tps > 0 ? ` (read ${fmt(S.prompt_tps)} tok/s)` : '');
+  return '● waiting for the model to start reading';
+}
+
+// ------------------------------------------------------------------------------------------- follow-up chat with the final model
+let FU_FILES = [], FU_UPLOADS = [];
+function fuRenderTurns(box, turns) {
+  box.innerHTML = '';
+  turns.forEach(t => {
+    const d = el('div', 'fu-turn ' + t.role);
+    if (t.unanswered) d.classList.add('unanswered');
+    const who = el('div', 'who'); who.appendChild(el('span', '', t.role === 'user' ? 'You' : 'Final model'));
+    if (t.unanswered) who.appendChild(el('span', 'small', 'no answer'));
+    if (t.speed && (t.speed.out_tps || t.speed.prompt_tps))
+      who.appendChild(el('span', 'small', (t.speed.prompt_tps ? `read ${(t.speed.prompt_tokens || 0).toLocaleString()} tok at ${(+t.speed.prompt_tps).toFixed(1)} tok/s · ` : '')
+                                        + `wrote ${t.speed.out_tokens} tok at ${(+t.speed.out_tps || 0).toFixed(1)} tok/s`));
+    if (t.stopped) who.appendChild(el('span', 'small', 'stopped'));
+    const cp = el('button', 'tiny secondary', 'Copy'); cp.style.marginLeft = 'auto'; cp.onclick = () => copyText(t.text, cp); who.appendChild(cp);
+    d.appendChild(who);
+    if ((t.files || []).length) { const f = el('div', 'fu-files'); t.files.forEach(n => f.appendChild(el('span', 'pill', n))); d.appendChild(f); }
+    const b = el('div', 'body');
+    if (t.role === 'user') b.textContent = t.text; else b.innerHTML = renderMD(t.text || '');
+    d.appendChild(b); box.appendChild(d);
+  });
+}
+let FU_SIG = '';
+function renderFollowup(st) {
+  const fu = st.followup, box = $('#fuBox');
+  box.style.display = fu ? '' : 'none';
+  if (!fu) return;
+  $('#fuInfo').textContent = `Talking to the model that wrote ${fu.chunk} (${fu.model || 'final-pass model'}). It still remembers the final pass` +
+    (fu.ctx ? ` -- ${fu.ctx.toLocaleString()} tokens in its memory` : '') + '. Ask questions, attach files for it to check, save it all and continue later.' +
+    (fu.kv ? ` Last saved memory: ${fu.kv.path}.` : '');
+  const sig = JSON.stringify([fu.turns.length, fu.kv && fu.kv.path, (fu.turns || []).map(t => (t.pending ? 'p' : '') + (t.unanswered ? 'u' : '')).join('')]);
+  if (sig !== FU_SIG) { FU_SIG = sig; fuRenderTurns($('#fuTurns'), fu.turns || []); }
+  const busy = !!fu.busy;
+  $('#fuSend').disabled = busy || st.running; $('#fuSave').disabled = busy || st.running || !(fu.turns || []).length && !fu.chunk;
+  $('#fuSaveText').disabled = busy || st.running;
+  if (fu.reread_next) $('#fuReread').checked = true;
+  $('#fuStop').style.display = busy ? '' : 'none';
+  $('#fuErr').textContent = fu.error || '';
+  const lv = $('#fuLive');
+  if (busy && liveState && liveState.chunk_id === 'followup') {
+    const se = document.scrollingElement || document.documentElement;
+    const atBottom = se.scrollHeight - se.scrollTop - window.innerHeight < 120;
+    lv.style.display = '';
+    $('#fuLiveStat').textContent = liveText(liveState).replace(/^● /, '');
+    if ($('#fuLiveText').dataset.raw !== (liveState.text || '')) {
+      $('#fuLiveText').dataset.raw = liveState.text || '';
+      $('#fuLiveText').innerHTML = renderMD(partialMD(liveState.text || ''));
+      if (atBottom) se.scrollTop = se.scrollHeight;     // read along; scroll up and it leaves you there
+    }
+  } else if (busy) { lv.style.display = ''; $('#fuLiveStat').textContent = 'starting...'; $('#fuLiveText').textContent = ''; }
+  else lv.style.display = 'none';
+}
+function fuRenderFiles() {
+  const box = $('#fuFiles'); box.innerHTML = '';
+  FU_FILES.forEach((p, i) => { const x = el('span', 'pill', p + '  ✕'); x.title = 'remove'; x.onclick = () => { FU_FILES.splice(i, 1); fuRenderFiles(); }; box.appendChild(x); });
+  FU_UPLOADS.forEach((u, i) => { const x = el('span', 'pill', u.name + ' (attached)  ✕'); x.onclick = () => { FU_UPLOADS.splice(i, 1); fuRenderFiles(); }; box.appendChild(x); });
+}
+async function fuAddUploads(files) {
+  for (const f of files) {
+    if (f.size > 8 * 1024 * 1024) { alert(`${f.name} is over 8 MB -- add it as a project file instead`); continue; }
+    FU_UPLOADS.push({name: f.name, text: await f.text()});
+  }
+  fuRenderFiles();
+}
+$('#fuAttach').onclick = () => $('#fuFile').click();
+$('#fuFile').onchange = (e) => { fuAddUploads([...e.target.files]); e.target.value = ''; };
+$('#fuBox').addEventListener('dragover', (e) => { e.preventDefault(); $('#fuBox').classList.add('drag'); });
+$('#fuBox').addEventListener('dragleave', () => $('#fuBox').classList.remove('drag'));
+$('#fuBox').addEventListener('drop', (e) => { e.preventDefault(); $('#fuBox').classList.remove('drag'); fuAddUploads([...e.dataTransfer.files]); });
+$('#fuProjFile').onfocus = async () => {
+  if ($('#fuProjList').children.length || !ROOT) return;
+  try { const full = await getJSON('/api/state?root=' + encodeURIComponent(ROOT));
+        (full.files || []).forEach(f => { const o = el('option'); o.value = f.path; $('#fuProjList').appendChild(o); }); } catch (e) {}
+};
+$('#fuProjFile').onchange = () => { const v = $('#fuProjFile').value.trim(); if (v && !FU_FILES.includes(v)) FU_FILES.push(v); $('#fuProjFile').value = ''; fuRenderFiles(); };
+$('#fuSend').onclick = async () => {
+  const text = $('#fuText').value.trim();
+  if (!text && !FU_FILES.length && !FU_UPLOADS.length) return;
+  $('#fuErr').textContent = '';
+  try {
+    await saveSettings(true);
+    await api('/api/followup/send', {text, files: FU_FILES, uploads: FU_UPLOADS, reread: $('#fuReread').checked});
+    $('#fuText').value = ''; FU_FILES = []; FU_UPLOADS = []; fuRenderFiles(); $('#fuReread').checked = false;
+    pollRun();
+  } catch (e) { $('#fuErr').textContent = e.message; }
+};
+$('#fuText').onkeydown = (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('#fuSend').click(); };
+$('#fuStop').onclick = () => api('/api/followup/stop', {}).catch(() => {});
+$('#fuSaveText').onclick = async () => {
+  const name = prompt('Name for this saved report (text only -- no model memory):', 'final review');
+  if (name === null) return;
+  try { const r = await api('/api/saves/create', {name}); flash('#finalSummary', `saved "${(r.save || r).name || name}"`); loadSaves(); }
+  catch (e) { $('#fuErr').textContent = e.message; }
+};
+$('#fuSave').onclick = async () => {
+  const name = prompt('Name for this saved report (the model memory is saved with it):', 'final review');
+  if (name === null) return;
+  $('#fuErr').textContent = 'saving the model memory...';
+  try { const r = await api('/api/followup/save', {name}); $('#fuErr').textContent = ''; flash('#finalSummary', `saved "${r.save.name}" -- model memory: ${r.kv.path}`); loadSaves(); pollRun(); }
+  catch (e) { $('#fuErr').textContent = e.message; }
+};
+
+let pollTimer = null;
+async function pollRun() {
+  if (!ROOT) return;
+  clearTimeout(pollTimer);
+  try {
+    const [st, live] = await Promise.all([getJSON('/api/state?lite=1&root=' + encodeURIComponent(ROOT)),
+                                          getJSON('/api/live?root=' + encodeURIComponent(ROOT)).catch(() => ({}))]);
+    const wasRunning = ST && ST.running;
+    ST = st; liveState = live && live.chunk_id ? live : {};
+    renderRunList($('#chunkList'), st.chunks, 'chunk');
+    $('#chunkSummary').textContent = st.chunks.length ? `${st.chunks.length} chunk(s): ${summarize(st.chunks)}` : 'No chunks built yet.';
+    $('#runLog').textContent = (st.run_log || []).join('\n');
+    $('#runLog').scrollTop = $('#runLog').scrollHeight;
+    const pm = $('#phaseMsg'); pm.style.display = st.phase_msg ? '' : 'none'; pm.textContent = st.phase_msg || '';
+    const r = st.running;
+    $('#btnRun').disabled = r || !st.chunks.length;
+    $('#btnStopAfter').disabled = !r; $('#btnStopNow').disabled = !r; $('#btnFinalStop').disabled = !r;
+    $('#btnBuildChunks').disabled = r; $('#btnScan').disabled = r; $('#btnBuildFinal').disabled = r;
+    $('#btnDeleteProject').disabled = r;
+    $('#btnFinalRun').disabled = r || !st.final_chunks.length;
+    $('#btnRun').textContent = r && st.run_mode === 'chunks' ? 'Running...' : 'Run';
+    const showFinal = st.final_chunks.length || st.chunks.some(c => c.status === 'done');
+    $('#finalCard').style.display = showFinal ? '' : 'none';
+    renderRunList($('#finalList'), st.final_chunks, 'final');
+    $('#finalSummary').textContent = st.final_chunks.length ? `${st.final_chunks.length} final chunk(s): ${summarize(st.final_chunks)}` : '';
+    renderManaged(st);
+    if (wasRunning && !r) loadSaves();
+    renderFollowup(st);
+    if (r || (st.followup && st.followup.busy)) pollTimer = setTimeout(pollRun, 900);
+  } catch (e) { pollTimer = setTimeout(pollRun, 3000); }
+}
+
+async function rerunRoute(route, label) {
+  const n = ((ST && ST.chunks) || []).filter(c => c.route === route && ['done', 'error', 'stopped'].includes(c.status)).length;
+  if (!n) { alert(`No finished ${label} chunks to re-run.`); return; }
+  if (!confirm(`Clear the output of ${n} ${label} chunk(s) so they run again with the current settings?`)) return;
+  try { await saveSettings(true); const r = await api('/api/items/rerun', {route}); flash('#projStatus', `${r.reset} chunk(s) reset`); pollRun(); } catch (e) { alert(e.message); }
+}
+$('#btnRerunMain').onclick = () => rerunRoute('main', 'chunk-model');
+$('#btnRerunLarge').onclick = () => rerunRoute('large', 'large-context');
+
+$('#btnBuildChunks').onclick = async () => {
+  $('#chunkSummary').textContent = 'building (splitting files uses the tokenizer, so this can take a moment)...';
+  try {
+    await saveSettings(true);
+    const r = await api('/api/build_chunks', {});
+    $('#chunkList').innerHTML = '';
+    await pollRun();
+    $('#chunkSummary').textContent += (r.excluded.length ? ` -- ${r.excluded.length} oversized file(s) excluded` : '') + (r.split_parts ? ` -- ${r.split_parts} split part(s)` : '');
+  } catch (e) { $('#chunkSummary').textContent = 'error: ' + e.message; }
+};
+$('#btnRun').onclick = async () => { try { await saveSettings(true); await api('/api/run/start', {}); } catch (e) { alert(e.message); } pollRun(); };
+$('#btnStopAfter').onclick = async () => { await api('/api/run/stop', {mode: 'after'}); pollRun(); };
+$('#btnStopNow').onclick = async () => { await api('/api/run/stop', {mode: 'now'}); pollRun(); };
+$('#btnFinalStop').onclick = async () => { await api('/api/run/stop', {mode: 'now'}); pollRun(); };
+$('#btnSnapshot').onclick = async () => {
+  const name = prompt('Name for this snapshot (optional):', '');
+  if (name === null) return;
+  try { await api('/api/saves/create', {name}); loadSaves(); } catch (e) { alert(e.message); }
+};
+async function fullState() { return getJSON('/api/state?root=' + encodeURIComponent(ROOT)); }
+$('#btnExportAll').onclick = async () => { const st = await fullState(); download(fileStamp(st, 'all'), reportMD(st, 'all')); };
+$('#btnCopyAll').onclick = async (e) => { const st = await fullState(); copyText(reportMD(st, 'all'), e.target); };
+$('#btnExportFinal').onclick = async () => { const st = await fullState(); download(fileStamp(st, 'final'), reportMD(st, 'final')); };
+$('#btnBuildFinal').onclick = async () => {
+  try {
+    await saveSettings(true);
+    const r = await api('/api/final/build', {});
+    $('#finalList').innerHTML = '';
+    await pollRun();
+    $('#finalSummary').textContent += (r.chunks_not_done.length ? ` (${r.chunks_not_done.length} chunk(s) without a finished result were left out)` : '')
+      + (r.exact ? '' : ' -- final-pass model not reachable, so packing used an estimate');
+  } catch (e) { $('#finalSummary').textContent = 'error: ' + e.message; }
+};
+$('#btnFinalRun').onclick = async () => { try { await saveSettings(true); await api('/api/final/run/start', {}); } catch (e) { alert(e.message); } pollRun(); };
+
+// Clean start: nothing is loaded until you choose. The last project is offered at the top.
+try {
+  const last = localStorage.getItem('harden_root');
+  if (last && !new URLSearchParams(location.search).has('new')) {
+    $('#lastProjPath').textContent = last; $('#lastProj').style.display = '';
+    $('#btnLastProj').onclick = () => { $('#root').value = last; $('#lastProj').style.display = 'none'; $('#btnLoad').click(); };
+  }
+} catch (e) {}
+$('#btnNewProject').onclick = () => {
+  // Leaves every project and its results as they are: it only clears this page so you can pick another folder.
+  if (ST && ST.running && !confirm('A run is going -- it keeps running in the background. Clear the page anyway?')) return;
+  location.href = location.pathname + '?new=1';
+};
+$('#nxNoteClose').onclick = () => { $('#nxNote').style.display = 'none'; try { sessionStorage.setItem('nxNoteDismissed', '1'); } catch (e) {} };
+loadSaves();
+loadNexus(false).then(showNexusNote);
+</script>
+</body>
+</html>

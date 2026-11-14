@@ -8,11 +8,19 @@ against the `Engine` C++ class directly and skip the HTTP layer too.
 It assumes you already have a working Nexus build (the `nexus_server`
 binary, or your own program linked against `engine.h`/`engine.cpp`) and a
 GGUF or native `.nxm`/`.nxmodel` model. It does not cover building Nexus
-from source or converting models — see the Quant Builder guide for that.
+from source or converting models — see the [Quant Builder Guide](../nexus_quant_builder/README.md) for that.
 
 Everything here is read directly from `tools/server.cpp`,
 `src/api/engine.h`, and `src/api/engine.cpp`. Where the server and the
 engine disagree slightly in naming, both names are given.
+
+Related pages:
+- [ACCESS_AND_API_KEYS.md](ACCESS_AND_API_KEYS.md): who may call the
+  server, API keys, and short copy-paste examples for your own app.
+- [CONVERSATION_MEMORY.md](CONVERSATION_MEMORY.md): the `/api/kv/*`
+  endpoints in depth.
+- [NEXUS_GUIDE.md](NEXUS_GUIDE.md): the complete manual, including every
+  environment variable.
 
 ---
 
@@ -76,12 +84,36 @@ template guesses wrong, or the model has no template at all)
 **GPU placement**
 | Flag | Meaning |
 |---|---|
-| `--gpu-layers <n>` | Layers to put on the primary GPU |
-| `--gpu-device <idx or name:...>` | Which Vulkan device; accepts a raw index or `name:<card substring>[#n]` resolved against the device list |
-| `--gpu2-layers` / `--gpu2-device` | Second GPU |
-| `--gpu3-layers` / `--gpu3-device`, `--gpuN-layers` / `--gpuN-device` | Any further GPUs (N ≥ 3) |
+| `--gpu-layers <n>` | Layers to put on the primary GPU (the first card; with the prompt speed-up on, the card that reads prompts) |
+| `--gpu-device <idx or name:...>` | Which Vulkan device; accepts a raw index or `name:<card name>[#n]` (the n-th card with that name). Names are safer: on laptops with two graphics systems the index order can change between programs and starts |
+| `--gpu2-layers <n\|auto>` / `--gpu2-device` | Second GPU. `auto` = as many layers as really fit, keeping `--park-keep-mb` free |
+| `--gpu3-layers` / `--gpu3-device`, `--gpuN-layers` / `--gpuN-device` | Any further GPUs (N ≥ 3), same rules |
 | `--list-devices` | Print Vulkan devices and exit |
-| `--probe` | Print a hardware/GPU JSON probe and exit — no model or license needed |
+| `--probe` | Print a hardware/GPU JSON probe and exit — no model needed |
+
+**Maximize GPU and oversized-prompt protection** (Linux, need
+`--turbo-prefill`; see [MAXIMIZE_GPU.md](MAXIMIZE_GPU.md))
+| Flag | Meaning |
+|---|---|
+| `--park-layers <N\|auto>` | Maximize GPU on the prompt card: N layers (auto = as many as fit) live there for writing, with no copy in RAM |
+| `--park-below-mb <MB>` | Oversized-prompt protection: drop layers from RAM while a prompt is read whenever free RAM is under this |
+| `--park-prefill-free-mb <MB\|auto>` | Card memory the prompt speed-up gets while a prompt is read (default auto = what it needs) |
+| `--park-keep-mb <MB>` | Card memory always left free when putting layers on a card (default 768) |
+| `--park-min-tokens <N>` | Optional: prompts shorter than N never move layers (default 0 = no such rule) |
+
+**Conversation memory** (see [CONVERSATION_MEMORY.md](CONVERSATION_MEMORY.md))
+| Flag | Meaning |
+|---|---|
+| `--ctx-limit <n\|auto\|max>` | `max` (default) = the model's maximum; a number = exactly that, even above the model's maximum; `auto` = no limit, grows until memory runs out |
+| `--auto-trim <on\|off>` | When full: drop the oldest messages and keep going (on, default) or stop (off) |
+
+**Access** (see [ACCESS_AND_API_KEYS.md](ACCESS_AND_API_KEYS.md))
+| Flag | Meaning |
+|---|---|
+| `--api-key <key>` | Require this key from other computers. Or set `NEXUS_API_KEY` (keeps it out of the process list) |
+| `--cors <lan\|local\|any>` | Which web pages may use the API: `lan` (default: this computer + local network), `local`, `any` |
+| `--allow-origin <url>` | Also allow web pages from this address; repeat or comma-separate |
+| `--enable-web-tools` | Turn on `/api/search*` (fetching web pages for a model). Off by default |
 
 **Second model (side-by-side)**
 | Flag | Meaning |
@@ -130,11 +162,18 @@ never block each other.
 
 ### Environment variables worth knowing about
 
-These aren't CLI flags, just env vars the server itself reads:
+These aren't CLI flags, just env vars the server itself reads. The full
+list, with every speed and graphics card switch the launcher sets, is in
+the [Nexus Guide](NEXUS_GUIDE.md#environment-variables).
 
 | Variable | Effect |
 |---|---|
 | `NEXUS_TRACE` | Trace verbosity (same thing `--trace-level` sets) |
+| `NEXUS_API_KEY` | The API key, instead of `--api-key` |
+| `NEXUS_WEB_DIR` | Where the web chat's `vendor/` folder (document readers) is, if not next to the server |
+| `NEXUS_MEM_GUARD=0`, `NEXUS_MEM_BUFFER_MB` | Memory safety buffer off, or how much RAM it keeps free (default 1024) |
+| `NEXUS_MM_INT8_CARDS` | 8-bit prompt math per card, e.g. `NVIDIA GeForce GTX 1060 3GB=1;AMD Radeon R9 200 Series (RADV HAWAII)=0` |
+| `NEXUS_CPU_INT8` | CPU 8-bit output math: `1`, `auto`, or unset (off) |
 | `NEXUS_HYBRID_PREFILL` | Toggles the hybrid prefill path server-side |
 | `NEXUS_VISION_MODE` | Overrides vision-encoder behavior |
 | `NEXUS_WEB_IMAGE_MAX_EDGE` | Max image edge (pixels) the server will accept via `/api/image/upload` before downscaling |
@@ -207,11 +246,21 @@ is support machinery around it.
    one if you didn't supply one). This first event is not buffered for
    replay — if your client disconnects before seeing it, a reconnect
    via `/api/continue/resume` will not re-send it.
-2. Then one event per generated chunk:
-   `{"token":"...","context_tokens":1234}`
-3. Optionally, a `{"notice":"..."}` event if the server's memory guard
-   had to intervene (e.g. trimmed context under pressure).
-4. A final literal line: `data: [DONE]\n\n`
+2. While the prompt is read:
+   `{"progress":{"pct":34.2,"tokens":98304,"tps":104.2,"eta":580}}`.
+   `tps` is 0 while still measuring, `eta` is -1 when unknown.
+3. Then one event per generated chunk:
+   `{"token":"...","gen":12,"context_tokens":1234}` — `gen` is the real
+   number of tokens generated so far, `context_tokens` the tokens in
+   memory, both the engine's own counts.
+4. Optionally, a `{"notice":"..."}` event when something is worth showing
+   the user: the memory safety buffer stopped the reply, or the
+   conversation reached its limit and nothing older could be dropped.
+   (When auto-trim drops old messages, `context_tokens` goes down; the web
+   chat compares it with `/api/kv/turns` to say how many were dropped.)
+5. `{"final":true,"gen":N,"context_tokens":M}` — exact totals for the
+   reply.
+6. A final literal line: `data: [DONE]\n\n`
 
 While the connection is open but nothing has streamed yet (still
 prefilling), the server sends SSE comment lines (`: ping\n\n`) roughly
@@ -260,7 +309,8 @@ genuinely retrying that same turn.
 | Endpoint | Use |
 |---|---|
 | `POST /api/continue` | Body: `{"conv_id":"...","model":"1"}`. Generates straight from wherever the warm KV cache left off — **no prefill at all**. Use this after a `/api/session/extend`/`/api/inject` call, or any time you've already gotten the context into the state you want and just want generation to continue. |
-| `POST /api/continue/resume` | Body: `{"model":"1","from":<event index>,"turn_id":"..."}`. Replays a `/api/chat` (or `/api/session/extend_turn`) job from the given event index onward — this is what a client calls after a page refresh or dropped connection to pick back up a reply that's still generating or already finished. |
+| `POST /api/continue/resume` | Body: `{"model":"1","from":<event index>,"turn_id":"..."}`. Replays a `/api/chat` (or `/api/session/extend_turn`) job from the given event index onward — this is what a client calls after a page refresh or dropped connection to pick back up a reply that's still generating or already finished. If the server no longer holds that job, the stream says `{"nojob":true}`. |
+| `GET /api/progress` | While a prompt is being read (for example during `extend_turn`): `{"active":true,"pct":..,"tokens":..,"tps":..,"eta":..}`, otherwise `{"active":false}`. |
 
 ### 3.5 Injecting content without a full chat turn
 
@@ -287,6 +337,27 @@ start-state load does — if you want `/api/chat`'s prefix-extend
 optimization to work after a session load, track the conversation
 yourself and pass a `conv_id`, or just use `/api/continue` to keep going
 without sending `messages` at all.
+
+### 3.6b Conversation memory: forget, archive, restore
+
+Edit what the model remembers without re-reading anything. Full details
+and the exactness rules (including recurrent models like Qwen3.5) are
+in [CONVERSATION_MEMORY.md](CONVERSATION_MEMORY.md).
+
+| Endpoint | Body | Does |
+|---|---|---|
+| `GET /api/kv/turns?model=1` | | The messages in memory (`start`, `end`, `role`, `protected`, `preview`), plus `context`, `limit`, `model_max`, `auto_trim`, `exact`, `bytes_per_token`. |
+| `POST /api/kv/remove` | `start, end, ctx` | Forget tokens `[start, end)`. |
+| `POST /api/kv/archive` | `start, end, ctx, label, msgs` | Save `[start, end)` as the next `A<n>`, then forget it. |
+| `GET /api/kv/archive/list` | | All archives, plus the model files running now. |
+| `POST /api/kv/archive/restore` | `id, ctx` | Put an archive back at the end of the conversation. |
+| `POST /api/kv/archive/rename` | `id, label` | |
+| `POST /api/kv/archive/delete` | `id` | |
+| `POST /api/kv/settings` | `limit: "max"\|"auto"\|N, auto_trim: "on"\|"off"` | Change the limit and auto-trim while running. |
+
+`ctx` is the context size your app last saw in `/api/kv/turns`. If the
+conversation changed since then, the edit is refused instead of hitting
+the wrong tokens.
 
 ### 3.7 Multi-slot context
 
@@ -353,7 +424,8 @@ rather than treating Nexus purely as an inference backend:
 chat into a project), `GET /api/chats/:id`, `DELETE /api/chats/:id`,
 `GET/POST /api/templates`, `DELETE /api/templates/:id`,
 `GET /api/folders`, `POST /api/folders/add`, `POST /api/folders/remove`,
-`POST /api/sessions/list_in`, `POST /api/sessions/meta`.
+`GET /api/sessions/list`, `POST /api/sessions/list_in`,
+`POST /api/sessions/meta`.
 
 If you're building a standalone front end with your own storage, ignore
 this section entirely and just talk to `/api/chat` + the session/
@@ -373,13 +445,38 @@ to `NEXUS_WEB_IMAGE_MAX_EDGE`/`NEXUS_WEB_IMAGE_MAX_PIXELS` if set.
 the embedded UI's "same chat open on two devices" handling. Not needed
 for a standalone integration.
 
-### 3.14 Search
+### 3.14 Search (off by default)
 
-`GET /api/search?q=` and `GET /api/search_detail?q=&n=` shell out to
-`curl` against DuckDuckGo's HTML search and return scraped results —
-this is what backs the built-in UI's web-search tool-use feature, not a
-general-purpose search API. It requires outbound network access from
-wherever the server process runs.
+`GET /api/search?q=`, `GET /api/search_detail?q=&n=` and
+`GET /api/search_detail_by_url` exist only when the server is started
+with `--enable-web-tools`. They shell out to `curl` against DuckDuckGo's
+HTML search (or fetch one page) and return scraped results. This backs
+the built-in UI's web-search tool use, not a general-purpose search API.
+It needs outbound network access from wherever the server runs.
+
+### 3.15 Access control
+
+Every request passes the same checks before it reaches a route:
+
+- **Web pages** (requests with an `Origin`): allowed from this computer
+  and the local network by default (`--cors lan`); internet sites are
+  refused unless listed with `--allow-origin`. A `Host` header that names
+  an internet domain is refused too (DNS rebinding).
+- **API key** (`--api-key` or `NEXUS_API_KEY`): when set, requests from
+  other computers must send `Authorization: Bearer <key>`,
+  `X-API-Key: <key>` or `?key=<key>`. Requests from this computer never
+  need it. A missing or wrong key gets `401` with
+  `{"ok":false,"need_key":true,"error":"..."}`.
+- Refusals are logged as `[access] refused <method> <path> from <address>: <reason>`.
+
+See [ACCESS_AND_API_KEYS.md](ACCESS_AND_API_KEYS.md).
+
+### 3.16 Static files
+
+`GET /` serves the built-in web chat. `GET /vendor/...` serves the
+document readers (PDF.js, Tesseract.js and so on) from the `web/vendor/`
+folder next to the server, or from `NEXUS_WEB_DIR`. Only plain file
+names are served (letters, digits, `. _ - /`, no `..`).
 
 ---
 
@@ -466,10 +563,15 @@ prefill-progress reporting in the server targets).
 
 `GenerateSession::run()`'s main loop also contains the speculative-
 decoding (MTP) path: `mtp_propose()` drafts ahead, `forward_verifyN()`
-verifies the draft against the real model in one batched pass, and
-accepted/rejected/bonus tokens are reconciled with a KV
-snapshot/restore on mismatch. Enable with `cfg.mtp_enabled = true` (and
-`mtp_n_predict`, `mtp_gpu`).
+checks the real token and every draft against the model in one batched
+pass, and a draft is kept only if it is exactly what the model itself
+samples at that position (same sampler, same penalties). On a miss,
+nothing is run through the model again: the accepted tokens are kept from
+that pass (their attention KV is already written), and only the
+linear-attention layers' recurrent state is replayed up to the last
+accepted token (`mtp_keep_checked`). The output is identical to writing
+without MTP. Enable with `cfg.mtp_enabled = true` (and `mtp_n_predict`,
+`mtp_gpu`).
 
 The pause-tag mechanism (`<nexus:tool>`/`<nexus:call>` by default, used
 for tool-use-style pausing with KV preserved mid-generation) is part of
@@ -617,6 +719,9 @@ Image attachments are **not** currently supported through a distributed
 
 - **Building any kind of chat front end, mobile app, or bot** → run the
   server, use `/api/chat` + `conv_id`. Everything else is optional.
+- **Long-running assistant that must not run out of memory** → leave
+  auto-trim on, or manage it yourself with `/api/kv/turns` +
+  `/api/kv/remove` / `/api/kv/archive`.
 - **Need retrieval/semantic search** → `/api/embed`.
 - **Want to give the model tool results mid-conversation** →
   `/api/inject`.
@@ -638,10 +743,13 @@ Image attachments are **not** currently supported through a distributed
 - `begin_session_speculative()` is a stub — use `cfg.mtp_enabled` on an
   ordinary session for real speculative decoding.
 - Distributed `extend_turn` can't take image attachments yet.
-- `/api/search` and `/api/search_detail` depend on outbound network
-  access and scrape DuckDuckGo's HTML via a `curl` subprocess — treat
-  this as a convenience feature for the built-in UI, not a stable
-  search API to build on.
+- `/api/search` and `/api/search_detail` are off unless the server runs
+  with `--enable-web-tools`, depend on outbound network access, and
+  scrape DuckDuckGo's HTML via a `curl` subprocess — treat this as a
+  convenience feature for the built-in UI, not a stable search API to
+  build on.
+- Conversation memory edits (`/api/kv/*`) are refused while a reply is
+  being written, and for a model split across computers.
 - A dropped SSE connection is always safe to reconnect from
   (`/api/continue/resume`), but the very first `{"conv_id":...}` event
   of a call is sent unbuffered and is not replayed — if your client

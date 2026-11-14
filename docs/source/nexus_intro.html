@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Nexus — Multi-Model Inference Engine</title>
+<style>
+  @page { size: letter; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: #0a0d14;
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: #e4e7ee;
+  }
+  .page {
+    width: 8.5in; height: 11in;
+    position: relative;
+    overflow: hidden;
+    page-break-after: always;
+    background: #0a0d14;
+  }
+  .page:last-child { page-break-after: auto; }
+
+  /* ---------- shared decorative bits ---------- */
+  .glow {
+    position: absolute; border-radius: 50%;
+    filter: blur(60px); opacity: 0.35; z-index: 0;
+  }
+  .accent { color: #9b8cfb; }
+  .accent-bg { background: #7c6af7; }
+  .muted { color: #8a90a3; }
+  .small-caps {
+    text-transform: uppercase; letter-spacing: 0.14em; font-size: 10.5pt;
+    font-weight: 600; color: #9b8cfb;
+  }
+  .rule { height: 1px; background: linear-gradient(90deg, rgba(124,106,247,0.6), rgba(124,106,247,0)); margin: 10px 0 18px 0; }
+
+  /* ---------- COVER PAGE ---------- */
+  .cover { display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; }
+  .cover .glow.g1 { width: 520px; height: 520px; top: -160px; left: -140px; background: #4b3fb0; }
+  .cover .glow.g2 { width: 480px; height: 480px; bottom: -180px; right: -150px; background: #2e6ea6; opacity: 0.28; }
+  .cover-content { position: relative; z-index: 1; width: 100%; padding: 0 0.4in; }
+  .cover .pill-row { max-width: 6.2in; margin-left: auto; margin-right: auto; }
+  .logo-mark { margin-bottom: 28px; }
+  .wordmark {
+    font-size: 64pt; font-weight: 700; letter-spacing: -0.01em; margin: 0;
+    color: #f2eefe;
+  }
+  .tagline { font-size: 17pt; color: #c6cbe0; margin-top: 10px; font-weight: 300; }
+  .sub-tagline { font-size: 12pt; color: #8a90a3; margin: 26px auto 0 auto; max-width: 5.4in; line-height: 1.55; }
+  .pill-row { margin-top: 46px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .pill {
+    border: 1px solid rgba(155,140,251,0.45); border-radius: 999px; padding: 7px 18px;
+    font-size: 10pt; color: #c6cbe0; letter-spacing: 0.02em;
+  }
+  .cover-footer { position: absolute; bottom: 46px; width: 100%; text-align: center; font-size: 9pt; color: #5a6072; letter-spacing: 0.08em; z-index: 1; }
+
+  /* ---------- CONTENT PAGES ---------- */
+  .content { padding: 0.75in 0.8in; }
+  .page-kicker { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .mini-diamond { width: 11px; height: 11px; }
+  h1.section-title { font-size: 25pt; font-weight: 700; margin: 2px 0 4px 0; color: #ffffff; }
+  .lede { font-size: 11.3pt; color: #aeb3c4; line-height: 1.6; max-width: 6.8in; margin: 0 0 26px 0; }
+
+  .feature {
+    display: flex; gap: 22px; align-items: flex-start;
+    margin-bottom: 30px;
+  }
+  .feature .icon-box {
+    flex: 0 0 auto; width: 58px; height: 58px; border-radius: 14px;
+    background: rgba(124,106,247,0.12); border: 1px solid rgba(124,106,247,0.35);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .feature .icon-box svg { width: 30px; height: 30px; }
+  .feature .body h2 { font-size: 14.5pt; margin: 2px 0 7px 0; color: #ffffff; font-weight: 650; }
+  .feature .body p { font-size: 10.6pt; line-height: 1.62; color: #c2c6d6; margin: 0 0 8px 0; }
+  .feature .body .callout {
+    display: inline-block; margin-top: 6px; font-size: 9.6pt; color: #b9aefc;
+    background: rgba(124,106,247,0.1); border-left: 2px solid #7c6af7; padding: 6px 12px; border-radius: 0 6px 6px 0;
+  }
+
+  .footer-page-num {
+    position: absolute; bottom: 0.45in; left: 0.8in; right: 0.8in;
+    display: flex; justify-content: space-between; font-size: 8.5pt; color: #4e5366; letter-spacing: 0.05em;
+  }
+
+  /* ---------- HARDWARE SHOWCASE PAGE ---------- */
+  .hw-page { background: radial-gradient(ellipse at 30% 15%, #16122e 0%, #0a0d14 55%); }
+  .hw-content { padding: 0.75in 0.8in; display: flex; flex-direction: column; height: 100%; }
+  .hw-rig-card {
+    margin-top: 20px; border-radius: 20px; border: 1px solid rgba(124,106,247,0.3);
+    background: linear-gradient(160deg, rgba(124,106,247,0.09), rgba(20,24,38,0.4));
+    padding: 34px 36px; display: flex; gap: 34px; align-items: center;
+  }
+  .rig-illustration { flex: 0 0 280px; }
+  .rig-specs { flex: 1; }
+  .rig-specs .spec-head { font-size: 10pt; letter-spacing: 0.12em; text-transform: uppercase; color: #8a90a3; margin-bottom: 14px; }
+  .spec-list { list-style: none; margin: 0; padding: 0; }
+  .spec-list li {
+    display: flex; align-items: baseline; gap: 12px; padding: 10px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 12.5pt;
+  }
+  .spec-list li:last-child { border-bottom: none; }
+  .spec-list .spec-label { color: #8f94a8; font-size: 9.5pt; min-width: 108px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .spec-list .spec-val { color: #fff; font-weight: 600; }
+  .spec-list .spec-val .hot { color: #9b8cfb; }
+
+  .hw-caption { margin-top: 20px; font-size: 10pt; color: #8a90a3; line-height: 1.6; max-width: 6.6in; }
+  .big-stat-row { display: flex; gap: 20px; margin-top: auto; padding-top: 24px; }
+  .big-stat { flex: 1; border-radius: 14px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); padding: 18px 20px; }
+  .big-stat .num { font-size: 26pt; font-weight: 700; color: #ffffff; }
+  .big-stat .num span { font-size: 12pt; color: #9b8cfb; font-weight: 600; }
+  .big-stat .lbl { font-size: 9pt; color: #8a90a3; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px; }
+
+  /* ---------- CLOSING PAGE ---------- */
+  .closing { display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; }
+  .closing .glow { width: 460px; height: 460px; top: 40%; left: 50%; transform: translate(-50%,-50%); background: #4b3fb0; opacity: 0.22; }
+  .closing-content { position: relative; z-index: 1; max-width: 5.6in; }
+  .closing h1 { font-size: 30pt; color: #fff; margin-bottom: 10px; }
+  .closing p.lede2 { font-size: 11.5pt; color: #b7bbcb; line-height: 1.65; margin-bottom: 30px; }
+  .doc-row { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-bottom: 36px; }
+  .doc-chip {
+    border: 1px solid rgba(124,106,247,0.4); border-radius: 12px; padding: 12px 18px; text-align: left;
+    background: rgba(124,106,247,0.07); width: 170px;
+  }
+  .doc-chip .dc-title { font-size: 10.5pt; color: #fff; font-weight: 650; margin-bottom: 3px; }
+  .doc-chip .dc-sub { font-size: 8.5pt; color: #8f94a8; line-height: 1.4; }
+  .feature.tight { margin-bottom: 30px; gap: 18px; }
+  .feature.tight .icon-box { width: 48px; height: 48px; border-radius: 12px; }
+  .feature.tight .icon-box svg { width: 26px; height: 26px; }
+  .feature.tight .body h2 { font-size: 13.5pt; margin-bottom: 5px; }
+  .feature.tight .body p { font-size: 10.5pt; line-height: 1.6; }
+  .closing-license { font-size: 9pt; color: #5a6072; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<!-- ============================================================ PAGE 1 — COVER ============================================================ -->
+<div class="page cover">
+  <div class="glow g1"></div>
+  <div class="glow g2"></div>
+  <div class="cover-content">
+    <div class="logo-mark">
+      <svg width="86" height="86" viewBox="0 0 86 86">
+        <polygon points="43,4 79,43 43,82 7,43" fill="none" stroke="#9b8cfb" stroke-width="2.4"/>
+        <polygon points="43,24 62,43 43,62 24,43" fill="#7c6af7"/>
+      </svg>
+    </div>
+    <h1 class="wordmark">NEXUS</h1>
+    <div class="tagline">The multi-model inference engine for hardware you already own</div>
+    <div class="sub-tagline">
+      Free. Local. Portable. Nexus brings real large-language-model performance to a single
+      modest graphics card, a drawer of old ones, an old laptop, or a CPU alone &mdash; and links
+      spare computers together when one isn't enough. No subscription, no cloud, nothing leaves your machine.
+    </div>
+    <div class="pill-row">
+      <div class="pill">Multi-model</div>
+      <div class="pill">GPU-accelerated prefill</div>
+      <div class="pill">Persistent KV memory</div>
+      <div class="pill">Every graphics card, old ones too</div>
+      <div class="pill">Multi-computer distributed inference</div>
+    </div>
+  </div>
+  <div class="cover-footer">LOCAL AI &nbsp;&middot;&nbsp; DEMOCRATIZED</div>
+</div>
+
+<!-- ============================================================ PAGE 2 — WHAT IS NEXUS / PREFILL ============================================================ -->
+<div class="page">
+  <div class="content">
+    <div class="page-kicker">
+      <svg class="mini-diamond" viewBox="0 0 16 16"><polygon points="8,1 15,8 8,15 1,8" fill="#7c6af7"/></svg>
+      <span class="small-caps">What is Nexus</span>
+    </div>
+    <h1 class="section-title">One engine, built for the hardware you have</h1>
+    <p class="lede">
+      Most local AI tools assume you own a graphics card built for the job. Nexus assumes you don't &mdash;
+      and is engineered from the ground up to get real results out of whatever you've actually got.
+    </p>
+
+    <div class="feature">
+      <div class="icon-box">
+        <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="7" height="7" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/></svg>
+      </div>
+      <div class="body">
+        <h2>Run several models at once</h2>
+        <p>
+          Nexus is a <strong>multi-model inference engine</strong> &mdash; load more than one model
+          into completely independent slots and run them side by side, each on its own port, each
+          with its own graphics-card placement, sampling settings, and conversation memory. Compare
+          two models head to head, or just keep a small fast model and a larger careful one both
+          warm and ready at the same time.
+        </p>
+      </div>
+    </div>
+
+    <div class="feature">
+      <div class="icon-box">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" fill="#b9aefc"/></svg>
+      </div>
+      <div class="body">
+        <h2>Prefill acceleration</h2>
+        <p>
+          Reading a long prompt &mdash; "prefill" &mdash; is normally the slowest, most hardware-hungry
+          part of talking to a large model, and the part that suffers most on modest hardware.
+          Nexus's prefill acceleration streams the model's layers through a graphics card <em>one at a
+          time</em> while the prompt is read, then hands off to the CPU (or a GPU-held copy) to
+          generate the reply. The card never needs to hold the whole model &mdash; it only ever
+          needs room for a single layer at once.
+        </p>
+        <span class="callout">The result: GPU-class prompt-reading speed from a card nowhere
+          near big enough to hold the model itself.</span>
+      </div>
+    </div>
+
+  </div>
+  <div class="footer-page-num"><span>NEXUS &mdash; MULTI-MODEL INFERENCE ENGINE</span><span>2</span></div>
+</div>
+
+<!-- ============================================================ PAGE 3 — KV RETENTION / DISTRIBUTED ============================================================ -->
+<div class="page">
+  <div class="content">
+    <div class="page-kicker">
+      <svg class="mini-diamond" viewBox="0 0 16 16"><polygon points="8,1 15,8 8,15 1,8" fill="#7c6af7"/></svg>
+      <span class="small-caps">How it stays fast</span>
+    </div>
+    <h1 class="section-title">Never pay the same compute cost twice</h1>
+    <p class="lede">
+      Two more ideas sit underneath everything Nexus does &mdash; one about memory, one about sharing
+      hardware you already own.
+    </p>
+
+    <div class="feature">
+      <div class="icon-box">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="13" r="8" stroke="#b9aefc" stroke-width="1.6"/><path d="M12 9v4l3 2" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round"/><path d="M8 2h8" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </div>
+      <div class="body">
+        <h2>Custom KV retention</h2>
+        <p>
+          Most local chat tools re-read the entire conversation from the first token, every single
+          turn. Nexus doesn't. Its KV cache &mdash; the model's own working memory of everything it
+          has already read &mdash; is retained and reusable. Hand it a huge document, wait once for
+          it to actually be read, and every short follow-up question after that skips the re-read
+          entirely. Save that state to disk, and reloading it drops you straight back into the
+          conversation where you left off &mdash; no re-processing, no waiting, just the answer.
+        </p>
+      </div>
+    </div>
+
+    <div class="feature">
+      <div class="icon-box">
+        <svg viewBox="0 0 24 24" fill="none"><rect x="2" y="7" width="7" height="10" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><rect x="15" y="7" width="7" height="10" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><path d="M9 12h6" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </div>
+      <div class="body">
+        <h2>Two computers, one model</h2>
+        <p>
+          Short on memory for a bigger model, but there's a second computer sitting around doing
+          nothing? Link them together. Nexus splits a single model's layers across two or more
+          machines over the network, turning a pair of ordinary computers into something neither
+          one could run alone.
+        </p>
+        <p>
+          The benefit isn't only extra capacity. If the main computer has even a single small
+          graphics card &mdash; as little as 1&nbsp;GB &mdash; it can still accelerate prefill for
+          the <em>whole</em> setup, prompt-reading speed included, even while the second, donor
+          computer has no graphics card at all. The slower machine only has to carry its share of
+          actually generating the reply, where it counts least.
+        </p>
+      </div>
+    </div>
+
+  </div>
+  <div class="footer-page-num"><span>NEXUS &mdash; MULTI-MODEL INFERENCE ENGINE</span><span>3</span></div>
+</div>
+
+<!-- ============================================================ PAGE 4 — BUILT FOR REAL WORK ============================================================ -->
+<div class="page">
+  <div class="content">
+    <div class="page-kicker">
+      <svg class="mini-diamond" viewBox="0 0 16 16"><polygon points="8,1 15,8 8,15 1,8" fill="#7c6af7"/></svg>
+      <span class="small-caps">Built for real work</span>
+    </div>
+    <h1 class="section-title">Everything you'd want from it</h1>
+    <p class="lede">
+      Fast is the start. Nexus is built to live on: long projects, piles of documents, every card
+      in the case, and other devices on your network.
+    </p>
+
+    <div class="feature tight">
+      <div class="icon-box"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h10M4 18h7" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round"/><path d="M16 15l4 4M20 15l-4 4" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+      <div class="body">
+        <h2>Conversation memory you control</h2>
+        <p>Forget any message and everything after it shifts back exactly into place. Archive a
+        finished piece of work &mdash; a manual, a code revision &mdash; and restore it later into any
+        chat, with no re-reading. When a conversation fills up, the oldest messages give way and
+        the chat keeps going.</p>
+      </div>
+    </div>
+
+    <div class="feature tight">
+      <div class="icon-box"><svg viewBox="0 0 24 24" fill="none"><path d="M6 2h8l4 4v16H6z" stroke="#b9aefc" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 2v4h4M9 12h6M9 16h6" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+      <div class="body">
+        <h2>Drop in your documents</h2>
+        <p>PDFs, Word files, spreadsheets, slides and e-books are read as text right in the chat,
+        with OCR for scanned pages. Drop a whole folder of specs and notes and the model gets all
+        of it, each file under its path. Offline, on every system.</p>
+      </div>
+    </div>
+
+    <div class="feature tight">
+      <div class="icon-box"><svg viewBox="0 0 24 24" fill="none"><rect x="2" y="5" width="20" height="6" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><rect x="2" y="14" width="20" height="6" rx="1.4" stroke="#b9aefc" stroke-width="1.6"/><circle cx="16" cy="8" r="1.6" fill="#b9aefc"/><circle cx="16" cy="17" r="1.6" fill="#b9aefc"/></svg></div>
+      <div class="body">
+        <h2>Every graphics card you have</h2>
+        <p>Mix any brands and ages. Each card holds as many layers as really fit, and every speed
+        option is measured on your hardware rather than guessed. Speculative decoding is lossless:
+        the exact same text, sooner.</p>
+      </div>
+    </div>
+
+    <div class="feature tight">
+      <div class="icon-box"><svg viewBox="0 0 24 24" fill="none"><path d="M12 2l8 3v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5z" stroke="#b9aefc" stroke-width="1.6" stroke-linejoin="round"/><path d="M8.5 12l2.5 2.5 4.5-5" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="body">
+        <h2>Safe on your network, easy to build on</h2>
+        <p>Chat from any device at home; websites on the internet can't touch your models. An
+        optional API key, a full streaming HTTP API, and a C++ engine you can link directly.</p>
+      </div>
+    </div>
+
+    <div class="feature tight">
+      <div class="icon-box"><svg viewBox="0 0 24 24" fill="none"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5" stroke="#b9aefc" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="body">
+        <h2>The Code Hardener</h2>
+        <p>Point local models at a whole codebase and walk away: security audits, notes sweeps or
+        your own prompt chains, chunk by chunk, with a final report from your strongest model.</p>
+      </div>
+    </div>
+
+  </div>
+  <div class="footer-page-num"><span>NEXUS &mdash; MULTI-MODEL INFERENCE ENGINE</span><span>4</span></div>
+</div>
+
+<!-- ============================================================ PAGE 5 — HARDWARE SHOWCASE ============================================================ -->
+<div class="page hw-page">
+  <div class="hw-content">
+    <div class="page-kicker">
+      <svg class="mini-diamond" viewBox="0 0 16 16"><polygon points="8,1 15,8 8,15 1,8" fill="#7c6af7"/></svg>
+      <span class="small-caps">Real hardware, real results</span>
+    </div>
+    <h1 class="section-title">This isn't a benchmark machine</h1>
+    <p class="lede">
+      None of this is theoretical &mdash; it's what Nexus is built and tested on. A graphics card
+      from 2016, a $20 used card beside it, off-the-shelf memory, and a 27-billion-parameter model
+      that has no business running this well on hardware like this.
+    </p>
+
+    <div class="hw-rig-card">
+      <div class="rig-illustration">
+        <svg viewBox="0 0 300 290" width="100%" height="100%">
+          <!-- graphics card -->
+          <g transform="translate(0,-10)">
+            <rect x="18" y="80" width="200" height="70" rx="8" fill="#1b2030" stroke="#3a3f58" stroke-width="2"/>
+            <rect x="18" y="80" width="200" height="14" rx="6" fill="#262c42"/>
+            <circle cx="150" cy="118" r="30" fill="#11141f" stroke="#4a4f6b" stroke-width="2"/>
+            <circle cx="150" cy="118" r="22" fill="none" stroke="#7c6af7" stroke-width="2"/>
+            <g stroke="#7c6af7" stroke-width="2">
+              <line x1="150" y1="98" x2="150" y2="106"/>
+              <line x1="150" y1="130" x2="150" y2="138"/>
+              <line x1="130" y1="118" x2="138" y2="118"/>
+              <line x1="162" y1="118" x2="170" y2="118"/>
+            </g>
+            <circle cx="70" cy="118" r="22" fill="#11141f" stroke="#4a4f6b" stroke-width="2"/>
+            <circle cx="70" cy="118" r="15" fill="none" stroke="#9b8cfb" stroke-width="2"/>
+            <rect x="8" y="100" width="10" height="36" rx="2" fill="#2a2f44"/>
+            <rect x="24" y="150" width="30" height="8" fill="#2a2f44"/>
+            <rect x="60" y="150" width="30" height="8" fill="#2a2f44"/>
+          </g>
+          <!-- RAM sticks -->
+          <g>
+            <rect x="238" y="18" width="22" height="90" rx="3" fill="#161b2a" stroke="#3a3f58" stroke-width="1.6"/>
+            <rect x="238" y="30" width="22" height="7" fill="#7c6af7" opacity="0.65"/>
+            <rect x="238" y="46" width="22" height="7" fill="#7c6af7" opacity="0.4"/>
+            <rect x="238" y="62" width="22" height="7" fill="#7c6af7" opacity="0.4"/>
+
+            <rect x="264" y="18" width="22" height="90" rx="3" fill="#161b2a" stroke="#3a3f58" stroke-width="1.6"/>
+            <rect x="264" y="30" width="22" height="7" fill="#7c6af7" opacity="0.65"/>
+            <rect x="264" y="46" width="22" height="7" fill="#7c6af7" opacity="0.4"/>
+            <rect x="264" y="62" width="22" height="7" fill="#7c6af7" opacity="0.4"/>
+
+            <rect x="212" y="18" width="22" height="90" rx="3" fill="#161b2a" stroke="#3a3f58" stroke-width="1.6"/>
+            <rect x="212" y="30" width="22" height="7" fill="#7c6af7" opacity="0.65"/>
+            <rect x="212" y="46" width="22" height="7" fill="#7c6af7" opacity="0.4"/>
+            <rect x="212" y="62" width="22" height="7" fill="#7c6af7" opacity="0.4"/>
+          </g>
+          <g transform="translate(0,95)">
+            <rect x="18" y="80" width="200" height="70" rx="8" fill="#1d1b2c" stroke="#4a3d5e" stroke-width="2"/>
+            <rect x="18" y="80" width="200" height="14" rx="6" fill="#2b2540"/>
+            <circle cx="70" cy="118" r="22" fill="#11141f" stroke="#4a4f6b" stroke-width="2"/>
+            <circle cx="70" cy="118" r="15" fill="none" stroke="#c46a8e" stroke-width="2"/>
+            <circle cx="150" cy="118" r="22" fill="#11141f" stroke="#4a4f6b" stroke-width="2"/>
+            <circle cx="150" cy="118" r="15" fill="none" stroke="#c46a8e" stroke-width="2"/>
+            <rect x="8" y="100" width="10" height="36" rx="2" fill="#2a2f44"/>
+          </g>
+          <text x="118" y="163" fill="#8a90a3" font-size="11" font-family="Segoe UI, Arial" text-anchor="middle">GTX 1060 &middot; reads prompts</text>
+          <text x="118" y="258" fill="#8a90a3" font-size="11" font-family="Segoe UI, Arial" text-anchor="middle">R9 290 &middot; holds layers</text>
+          <text x="248" y="122" fill="#8a90a3" font-size="11" font-family="Segoe UI, Arial" text-anchor="middle">RAM</text>
+        </svg>
+      </div>
+      <div class="rig-specs">
+        <div class="spec-head">The test rig</div>
+        <ul class="spec-list">
+          <li><span class="spec-label">Memory</span><span class="spec-val">25&nbsp;GB DDR4 <span class="hot">@ 2200&nbsp;MHz</span></span></li>
+          <li><span class="spec-label">Prompt card</span><span class="spec-val">3&nbsp;GB &mdash; GeForce GTX 1060</span></li>
+          <li><span class="spec-label">Helper card</span><span class="spec-val">4&nbsp;GB &mdash; Radeon R9 290 <span class="hot">($20)</span></span></li>
+          <li><span class="spec-label">Model</span><span class="spec-val">Qwen 3.6 27B, <span class="hot">4-bit</span></span></li>
+          <li><span class="spec-label">Reading</span><span class="spec-val"><span class="hot">42&ndash;50 tok/sec</span></span></li>
+          <li><span class="spec-label">Writing</span><span class="spec-val">over 1 tok/sec</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="hw-caption">
+      An 11,400-token prompt read in about four and a half minutes, 60,000-token prompts still above
+      30 tokens per second, and the desktop stays usable the whole time &mdash; on a 3&nbsp;GB card
+      from 2016, a used card that cost less than lunch, and 25&nbsp;GB of ordinary memory. No
+      data-center GPU, no multi-thousand-dollar rig. This is the entire point of Nexus: the hardware
+      most people already own, put to real use.
+    </p>
+
+    <div class="big-stat-row">
+      <div class="big-stat"><div class="num">3+4<span>GB VRAM</span></div><div class="lbl">Two old graphics cards</div></div>
+      <div class="big-stat"><div class="num">27B<span>params</span></div><div class="lbl">Model size (4-bit)</div></div>
+      <div class="big-stat"><div class="num">~45<span>tok/s</span></div><div class="lbl">Prompt reading</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ PAGE 5 — CLOSING ============================================================ -->
+<div class="page closing">
+  <div class="glow"></div>
+  <div class="closing-content">
+    <h1>Get started</h1>
+    <p class="lede2">
+      Nexus is free and runs entirely on your own machine. Pick a model, point Nexus at it, and
+      you're generating &mdash; no account, no cloud round-trip, nothing phoned home.
+    </p>
+    <div class="doc-row">
+      <div class="doc-chip">
+        <div class="dc-title">The Nexus Guide</div>
+        <div class="dc-sub">Everything in one place: setups, every setting, flag and endpoint.</div>
+      </div>
+      <div class="doc-chip">
+        <div class="dc-title">Launcher Guide</div>
+        <div class="dc-sub">First run through picking a model, GPU placement, and starting your first chat.</div>
+      </div>
+      <div class="doc-chip">
+        <div class="dc-title">Quant Builder Guide</div>
+        <div class="dc-sub">Converting and packaging your own models into Nexus's native format.</div>
+      </div>
+      <div class="doc-chip">
+        <div class="dc-title">Graphics Cards &amp; Speed</div>
+        <div class="dc-sub">Several cards, 8-bit math, MTP, and getting the most from your slots.</div>
+      </div>
+      <div class="doc-chip">
+        <div class="dc-title">Conversation Memory</div>
+        <div class="dc-sub">Limits, auto-trim, and forgetting, archiving and restoring.</div>
+      </div>
+      <div class="doc-chip">
+        <div class="dc-title">Engine / API Guide</div>
+        <div class="dc-sub">Running headless, the full HTTP API, and linking the engine directly.</div>
+      </div>
+    </div>
+    <div class="closing-license">Released under AGPLv3 &nbsp;&middot;&nbsp; github.com/sjnettifee/nexus</div>
+  </div>
+</div>
+
+</body>
+</html>
