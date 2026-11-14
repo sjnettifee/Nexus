@@ -1,0 +1,50 @@
+// nexus/src/gpu/shaders/rms_norm.comp — RMS Normalization
+//
+// out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i]
+//
+// One workgroup per call. Up to 256 threads cooperate to compute sum(x^2),
+// then all threads normalize in parallel.
+// Binding 0 = x_in  [n] f32 (read)
+// Binding 1 = weight [n] f32 (scale)
+// Binding 2 = x_out  [n] f32 (write)
+// Push constant: n_elements, eps
+
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer XIn    { float x_in[];  };
+layout(set = 0, binding = 1) readonly  buffer Weight { float w[];     };
+layout(set = 0, binding = 2) writeonly buffer XOut   { float x_out[]; };
+
+layout(push_constant) uniform PC {
+    uint  n;
+    float eps;
+    uint  pad0;
+    uint  pad1;
+} pc;
+
+shared float s_sum[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n   = pc.n;
+
+    // Each thread accumulates x^2 for its elements
+    float partial = 0.0;
+    for (uint i = tid; i < n; i += 256u)
+        partial += x_in[i] * x_in[i];
+    s_sum[tid] = partial;
+    barrier(); memoryBarrierShared();
+
+    // Tree reduction for sum
+    for (uint stride = 128u; stride >= 1u; stride >>= 1u) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier(); memoryBarrierShared();
+    }
+
+    float rms_inv = inversesqrt(s_sum[0] / float(n) + pc.eps);
+
+    // Normalize and scale
+    for (uint i = tid; i < n; i += 256u)
+        x_out[i] = x_in[i] * rms_inv * w[i];
+}

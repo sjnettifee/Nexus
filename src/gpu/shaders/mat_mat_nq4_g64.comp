@@ -1,0 +1,130 @@
+// nexus/src/gpu/shaders/mat_mat_nq4_g64.comp -- Nexus native NQ4_G64, prompt reading (matrix x many vectors)
+//
+//   Y[token, row] = dot(W[row, :], X[token, :])
+//
+// Block layout (same as mat_vec_nq4_g64.comp): group of 64 weights = 34 bytes: f16 scale + 32 packed nibbles,
+// weight 2k is the low nibble of byte k, weight 2k+1 the high nibble, value = (nibble - 8) * scale.
+//
+// SPEED DESIGN (v3, tiled, 4x4 register tile).  The old kernel gave every (row, token) pair its own thread, so each weight was fetched byte by byte and
+// decoded once PER TOKEN (36 times for a 36-token prompt, 1000+ times for a long one) and the loads of neighbouring threads were
+// scattered over different rows.  Measured on a 27B model that put ~200 ms of GPU time into every layer's matrices.
+//
+// This kernel computes a 64-row x 64-token tile of Y per workgroup of 256 threads and walks the columns one quantisation group (64
+// weights) at a time:
+//   1. the 64 rows' records for this group are read ONCE (each thread decodes 16 weights -> shared memory, as floats),
+//   2. the 64 tokens' 64 x-values are copied to shared memory,
+//   3. every thread multiplies a 4-row x 4-token register tile over the 64 columns (16 FMAs per 2 shared reads, both 128-bit).
+// So each weight is decoded once per 64 tokens instead of once per token, and the x values are read once per 64 rows.
+//
+// DISPATCH: groups = (ceil(out_rows / 64), ceil(n_tokens / 64)).  Backend Pipeline::mm_tile_rows/mm_tile_toks must be 64 / 64.
+// Push constants: out_rows, in_cols, n_blocks_per_row, n_tokens (unchanged).
+
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer InputBuf   { float x_in[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];    };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    uint n_tokens;
+} pc;
+
+const uint BM  = 64u;    // rows per tile
+const uint BN  = 64u;    // tokens per tile
+const uint BK  = 64u;    // columns per step == one quantisation group
+const uint REC = 34u;    // bytes per group record
+
+shared vec4 Ws4[BK * (BM / 4u)];   // [k][row/4] -> 4 consecutive rows of column k
+shared vec4 Xs4[BK * (BN / 4u)];   // [k][tok/4] -> 4 consecutive tokens of column k
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * BM;
+    const uint tok0 = gl_WorkGroupID.y * BN;
+
+    // compute-phase ownership: 4 consecutive rows x 4 consecutive tokens
+    const uint tx = tid & 15u;          // rows  tx*4 .. tx*4+3
+    const uint ty = tid >> 4u;          // tokens ty*4 .. ty*4+3
+
+    // weight-load ownership: row (tid/4), 8 bytes (= 16 weights) starting at byte part*8 of the record's nibble area
+    const uint wl_row  = tid >> 2u;
+    const uint wl_part = tid & 3u;
+
+    // x-load ownership: token (tid/4), 16 consecutive columns
+    const uint xl_tok = tid >> 2u;
+    const uint xl_col = (tid & 3u) * 16u;
+
+    float acc[4][4];
+    for (uint i = 0u; i < 4u; ++i) for (uint j = 0u; j < 4u; ++j) acc[i][j] = 0.0;
+
+    const uint nb  = pc.n_blocks_per_row;
+    const uint row = row0 + wl_row;
+
+    for (uint g = 0u; g < nb; ++g) {
+        // ---- 1. decode this thread's 16 weights into shared memory ----
+        {
+            const uint k0 = wl_part * 16u;
+            if (row < pc.out_rows) {
+                const uint rec = (row * nb + g) * REC;               // always even
+                const uint sw  = W[rec >> 2u];
+                const float scale = unpackHalf2x16((sw >> ((rec & 2u) * 8u)) & 0xFFFFu).x;
+
+                const uint off = rec + 2u + wl_part * 8u;            // even
+                const uint wi  = off >> 2u;
+                uint lo, hi;
+                if ((off & 2u) == 0u) {                              // word aligned
+                    lo = W[wi]; hi = W[wi + 1u];
+                } else {                                             // straddles three words
+                    const uint a = W[wi], b = W[wi + 1u], c = W[wi + 2u];
+                    lo = (a >> 16u) | (b << 16u);
+                    hi = (b >> 16u) | (c << 16u);
+                }
+                for (uint j = 0u; j < 8u; ++j) {
+                    const uint word = (j < 4u) ? lo : hi;
+                    const uint bv = (word >> ((j & 3u) * 8u)) & 0xFFu;
+                    const uint k = k0 + 2u * j;
+                    Ws4[k * 16u + (wl_row >> 2u)][wl_row & 3u]        = (float(bv & 0x0Fu) - 8.0) * scale;
+                    Ws4[(k + 1u) * 16u + (wl_row >> 2u)][wl_row & 3u] = (float(bv >> 4u)   - 8.0) * scale;
+                }
+            } else {
+                for (uint j = 0u; j < 16u; ++j)
+                    Ws4[(k0 + j) * 16u + (wl_row >> 2u)][wl_row & 3u] = 0.0;
+            }
+        }
+        // ---- 2. this thread's 16 x values ----
+        {
+            const uint tok = tok0 + xl_tok;
+            const uint colbase = g * BK + xl_col;
+            for (uint j = 0u; j < 16u; ++j) {
+                const uint col = colbase + j;
+                const float v = (tok < pc.n_tokens && col < pc.in_cols) ? x_in[tok * pc.in_cols + col] : 0.0;
+                Xs4[(xl_col + j) * 16u + (xl_tok >> 2u)][xl_tok & 3u] = v;
+            }
+        }
+        barrier();
+
+        // ---- 3. 4 rows x 4 tokens x 64 columns ----
+        for (uint k = 0u; k < BK; ++k) {
+            const vec4 w = Ws4[k * 16u + tx];
+            const vec4 xv = Xs4[k * 16u + ty];
+            acc[0][0] += w.x * xv.x; acc[0][1] += w.x * xv.y; acc[0][2] += w.x * xv.z; acc[0][3] += w.x * xv.w;
+            acc[1][0] += w.y * xv.x; acc[1][1] += w.y * xv.y; acc[1][2] += w.y * xv.z; acc[1][3] += w.y * xv.w;
+            acc[2][0] += w.z * xv.x; acc[2][1] += w.z * xv.y; acc[2][2] += w.z * xv.z; acc[2][3] += w.z * xv.w;
+            acc[3][0] += w.w * xv.x; acc[3][1] += w.w * xv.y; acc[3][2] += w.w * xv.z; acc[3][3] += w.w * xv.w;
+        }
+        barrier();
+    }
+
+    for (uint j = 0u; j < 4u; ++j) {
+        const uint tok = tok0 + ty * 4u + j;
+        if (tok >= pc.n_tokens) continue;
+        for (uint i = 0u; i < 4u; ++i) {
+            const uint r = row0 + tx * 4u + i;
+            if (r < pc.out_rows) y[tok * pc.out_rows + r] = acc[i][j];
+        }
+    }
+}

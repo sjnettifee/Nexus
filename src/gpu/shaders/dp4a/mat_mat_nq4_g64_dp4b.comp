@@ -1,0 +1,134 @@
+// nexus/src/gpu/shaders/mat_mat_nq4_g64_dp4b.comp -- variant B (two token passes) -- NQ4_G64 prompt reading with int8 dot products (dp4a)
+//
+//   Y[token, row] = dot(W[row, :], X[token, :])     X pre-quantised to int8 by quant_act_q8.comp (scale per 32 values)
+//
+// Same 128-row x 128-token tile and 8x8 per-thread register tile as mat_mat_nq4_g64_big, but the inner product is done with
+// dotPacked4x8 (4 int8 multiply-adds per instruction) on integer weights (nibble - 8) and int8 activations; the float scales
+// (f16 weight scale per 64, activation scale per 32) are applied once per 32-column step.
+// Weight nibbles are unpacked without shuffling: for each 32-bit word of 8 weights, (w & 0x0F0F0F0F) holds weights 0,2,4,6 and
+// ((w >> 4) & 0x0F0F0F0F) holds weights 1,3,5,7; quant_act_q8 writes the activations in the same even/odd order.
+// Requires VK_KHR_shader_integer_dot_product (feature shaderIntegerDotProduct) and in_cols % 64 == 0.
+// Bindings: 0 weights (uint[]), 1 xq (uvec4[]), 2 xs (float[]), 3 y (float[]).  DISPATCH (ceil(out_rows/128), ceil(n_tokens/128)).
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// dp4() below is rewritten into OpSDotAccSat (SPV_KHR_integer_dot_product) by tools/patch_dp4a.py after glslang runs
+int dp4(uint a, uint b, int c) { return c + int(a ^ b); }   // placeholder body
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];   };
+layout(set = 0, binding = 1) readonly buffer ActBuf     { uvec4 xq4[]; };
+layout(set = 0, binding = 2) readonly buffer ScaleBuf   { float xs[];  };
+layout(set = 0, binding = 3) writeonly buffer OutputBuf { float y[];   };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    uint n_tokens;
+} pc;
+
+const uint REC = 34u;
+
+shared uvec4 Ws4[8u * 32u];     // [kq][row/4]   packed int8 weights, 4 consecutive k per word
+shared uvec4 Xs4[8u * 32u];     // [kq][tok/4]
+shared float Wsc[128];
+shared float Xsc[128];
+
+uint fix_signed(uint nib4) {    // four nibbles (one per byte, 0..15) -> four int8 (nibble - 8)
+    return ((nib4 | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * 128u;
+    const uint tok0 = gl_WorkGroupID.y * 128u;
+    const uint item = tid >> 1u;
+    const uint half_ = tid & 1u;
+    const uint ld_row = row0 + item;
+    const uint ld_tok = tok0 + item;
+    const uint tx = tid & 15u;
+    const uint ty = tid >> 4u;
+
+    float acc[8][8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) [[unroll]] for (uint j = 0u; j < 8u; ++j) acc[i][j] = 0.0;
+
+    const uint nb    = pc.n_blocks_per_row;
+    const uint steps = nb * 2u;
+    const uint xrow_w4 = pc.in_cols >> 4u;       // uvec4 per token
+    const uint xrow_s  = pc.in_cols >> 5u;       // scales per token
+
+    // prefetch registers
+    uint p_lo, p_hi; float p_wsc; uvec4 p_x; float p_xsc;
+
+    for (uint s = 0u; s <= steps; ++s) {
+        // ---- registers (loaded last iteration) -> shared ----
+        if (s > 0u) {
+            const uint w0 = p_lo, w1 = p_hi;
+            Ws4[(half_ * 4u + 0u) * 32u + (item >> 2u)][item & 3u] = fix_signed(w0 & 0x0F0F0F0Fu);
+            Ws4[(half_ * 4u + 1u) * 32u + (item >> 2u)][item & 3u] = fix_signed((w0 >> 4u) & 0x0F0F0F0Fu);
+            Ws4[(half_ * 4u + 2u) * 32u + (item >> 2u)][item & 3u] = fix_signed(w1 & 0x0F0F0F0Fu);
+            Ws4[(half_ * 4u + 3u) * 32u + (item >> 2u)][item & 3u] = fix_signed((w1 >> 4u) & 0x0F0F0F0Fu);
+            Xs4[(half_ * 4u + 0u) * 32u + (item >> 2u)][item & 3u] = p_x.x;
+            Xs4[(half_ * 4u + 1u) * 32u + (item >> 2u)][item & 3u] = p_x.y;
+            Xs4[(half_ * 4u + 2u) * 32u + (item >> 2u)][item & 3u] = p_x.z;
+            Xs4[(half_ * 4u + 3u) * 32u + (item >> 2u)][item & 3u] = p_x.w;
+            if (half_ == 0u) { Wsc[item] = p_wsc; Xsc[item] = p_xsc; }
+        }
+        barrier();
+
+        // ---- issue loads for step s (consumed at the top of the next iteration) ----
+        if (s < steps) {
+            const uint g = s >> 1u, sub = s & 1u;
+            if (ld_row < pc.out_rows) {
+                const uint rec = (ld_row * nb + g) * REC;
+                const uint sw  = W[rec >> 2u];
+                p_wsc = unpackHalf2x16((sw >> ((rec & 2u) * 8u)) & 0xFFFFu).x;
+                const uint off = rec + 2u + sub * 16u + half_ * 8u;
+                const uint wi  = off >> 2u;
+                if ((off & 2u) == 0u) { p_lo = W[wi]; p_hi = W[wi + 1u]; }
+                else { const uint a = W[wi], b = W[wi + 1u], c = W[wi + 2u]; p_lo = (a >> 16u) | (b << 16u); p_hi = (b >> 16u) | (c << 16u); }
+            } else { p_wsc = 0.0; p_lo = 0x08080808u >> 0u; p_hi = 0x08080808u >> 0u; p_lo = 0u; p_hi = 0u; }
+            if (ld_tok < pc.n_tokens) {
+                p_x = xq4[ld_tok * xrow_w4 + s * 2u + half_];
+                p_xsc = xs[ld_tok * xrow_s + s];
+            } else { p_x = uvec4(0u); p_xsc = 0.0; }
+        }
+
+        // ---- 8 rows x 8 tokens x 32 columns on integer dot products ----
+        if (s > 0u) {
+            const vec4 wsa = vec4(Wsc[tx * 4u], Wsc[tx * 4u + 1u], Wsc[tx * 4u + 2u], Wsc[tx * 4u + 3u]);
+            const vec4 wsb = vec4(Wsc[64u + tx * 4u], Wsc[64u + tx * 4u + 1u], Wsc[64u + tx * 4u + 2u], Wsc[64u + tx * 4u + 3u]);
+            const float ws[8] = float[8](wsa.x, wsa.y, wsa.z, wsa.w, wsb.x, wsb.y, wsb.z, wsb.w);
+            [[unroll]] for (uint jh = 0u; jh < 2u; ++jh) {          // two passes over 4 tokens each: fewer live integer accumulators
+                int t[8][4];
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) [[unroll]] for (uint j = 0u; j < 4u; ++j) t[i][j] = 0;
+                for (uint kq = 0u; kq < 8u; ++kq) {
+                    const uvec4 wa = Ws4[kq * 32u + tx];
+                    const uvec4 wb = Ws4[kq * 32u + 16u + tx];
+                    const uvec4 xa = Xs4[kq * 32u + (jh == 0u ? ty : 16u + ty)];
+                    const uint w[8] = uint[8](wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w);
+                    const uint x[4] = uint[4](xa.x, xa.y, xa.z, xa.w);
+                    [[unroll]] for (uint i = 0u; i < 8u; ++i)
+                        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                            t[i][j] = dp4(w[i], x[j], t[i][j]);
+                }
+                const vec4 xsa = vec4(Xsc[jh * 64u + ty * 4u], Xsc[jh * 64u + ty * 4u + 1u], Xsc[jh * 64u + ty * 4u + 2u], Xsc[jh * 64u + ty * 4u + 3u]);
+                const float xsv[4] = float[4](xsa.x, xsa.y, xsa.z, xsa.w);
+                [[unroll]] for (uint i = 0u; i < 8u; ++i)
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                        acc[i][jh * 4u + j] += float(t[i][j]) * (ws[i] * xsv[j]);
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+        const uint tok = tok0 + ((j < 4u) ? (ty * 4u + j) : (64u + ty * 4u + (j - 4u)));
+        if (tok >= pc.n_tokens) continue;
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            const uint r = row0 + ((i < 4u) ? (tx * 4u + i) : (64u + tx * 4u + (i - 4u)));
+            if (r < pc.out_rows) y[tok * pc.out_rows + r] = acc[i][j];
+        }
+    }
+}

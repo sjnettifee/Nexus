@@ -1,0 +1,46 @@
+// nexus/src/gpu/shaders/qwen35_conv1d.comp
+// Full-prompt Qwen3Next/GatedDeltaNet depthwise causal conv.
+// One invocation computes one (token, channel) output.
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer MixedBuf { float mixed[]; };
+layout(set = 0, binding = 1) readonly  buffer StateBuf { float state[]; };
+layout(set = 0, binding = 2) readonly  buffer WeightBuf{ float weight[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf   { float outv[]; };
+
+layout(push_constant) uniform PC {
+    uint n_tokens;
+    uint conv_dim;
+    uint kernel;
+    uint pad0;
+} pc;
+
+float sigmoid_safe(float x) {
+    if (x > 80.0) return 1.0;
+    if (x < -80.0) return 0.0;
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint c = gl_GlobalInvocationID.y;
+    if (t >= pc.n_tokens || c >= pc.conv_dim) return;
+
+    float sum = 0.0;
+    uint hist = pc.kernel > 0u ? pc.kernel - 1u : 0u;
+
+    for (uint k = 0u; k < pc.kernel; ++k) {
+        int src_t = int(t) + int(k) - int(hist);
+        float xv = 0.0;
+        if (src_t < 0) {
+            uint state_k = uint(src_t + int(hist));
+            xv = state[c * hist + state_k];
+        } else {
+            xv = mixed[uint(src_t) * pc.conv_dim + c];
+        }
+        sum += xv * weight[c * pc.kernel + k];
+    }
+
+    outv[t * pc.conv_dim + c] = sum * sigmoid_safe(sum);
+}

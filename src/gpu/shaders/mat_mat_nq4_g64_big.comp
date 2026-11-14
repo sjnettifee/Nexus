@@ -1,0 +1,136 @@
+// nexus/src/gpu/shaders/mat_mat_nq4_g64_big.comp -- NQ4_G64 prompt reading, large-tile kernel (v4)
+//
+//   Y[token, row] = dot(W[row, :], X[token, :])
+//
+// For long prompts.  A workgroup of 256 threads computes a 128-row x 128-token tile of Y; every thread owns an 8 x 8 register tile
+// (64 accumulators), so each pair of shared-memory reads feeds 4x more multiply-adds than the 64x64 kernel (v3).  The columns are
+// walked 32 at a time (half a quantisation group).  The next step's global loads are issued BEFORE the current step's maths and
+// kept in registers until the barrier, so memory latency overlaps with the multiply-adds instead of stalling them.
+//
+// Weight records are the same as mat_vec_nq4_g64 / mat_mat_nq4_g64: 34 bytes per 64 weights (f16 scale + 32 packed nibbles,
+// weight 2k = low nibble of byte k, 2k+1 = high nibble, value = (nibble - 8) * scale), only 2-byte aligned -> unaligned word reads.
+//
+// Requires in_cols % 64 == 0 (always true for NQ4_G64).  DISPATCH: groups = (ceil(out_rows/128), ceil(n_tokens/128)).
+// Backend Pipeline::mm_tile_rows / mm_tile_toks must be 128 / 128.  Push constants identical to the other mat_mat kernels.
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];  };
+layout(set = 0, binding = 1) readonly buffer InputBuf   { vec4  x4[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];  };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    uint n_tokens;
+} pc;
+
+const uint BM  = 128u;
+const uint BN  = 128u;
+const uint BK  = 32u;
+const uint REC = 34u;
+
+shared vec4 Ws4[BK * 32u];   // [k][row/4]  decoded weights
+shared vec4 Xs4[BK * 32u];   // [k][tok/4]  inputs
+
+// register-resident prefetch of the next step
+uint  p_lo, p_hi;
+float p_scale;
+vec4  p_x[4];
+
+void load_step(uint s, uint row, uint tok, uint half_) {
+    const uint nb  = pc.n_blocks_per_row;
+    const uint g   = s >> 1u;
+    const uint sub = s & 1u;
+    if (row < pc.out_rows) {
+        const uint rec = (row * nb + g) * REC;                 // even
+        const uint sw  = W[rec >> 2u];
+        p_scale = unpackHalf2x16((sw >> ((rec & 2u) * 8u)) & 0xFFFFu).x;
+        const uint off = rec + 2u + sub * 16u + half_ * 8u;    // even
+        const uint wi  = off >> 2u;
+        if ((off & 2u) == 0u) {
+            p_lo = W[wi]; p_hi = W[wi + 1u];
+        } else {
+            const uint a = W[wi], b = W[wi + 1u], c = W[wi + 2u];
+            p_lo = (a >> 16u) | (b << 16u);
+            p_hi = (b >> 16u) | (c << 16u);
+        }
+    } else {
+        p_scale = 0.0; p_lo = 0u; p_hi = 0u;
+    }
+    if (tok < pc.n_tokens) {
+        const uint base = (tok * pc.in_cols + s * BK + half_ * 16u) >> 2u;
+        p_x[0] = x4[base]; p_x[1] = x4[base + 1u]; p_x[2] = x4[base + 2u]; p_x[3] = x4[base + 3u];
+    } else {
+        p_x[0] = vec4(0.0); p_x[1] = vec4(0.0); p_x[2] = vec4(0.0); p_x[3] = vec4(0.0);
+    }
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * BM;
+    const uint tok0 = gl_WorkGroupID.y * BN;
+
+    // load/store ownership: item (row for weights, token for inputs) = tid/2, half = tid&1 -> 16 consecutive columns
+    const uint ld_item = tid >> 1u;
+    const uint ld_half = tid & 1u;
+    const uint ld_row  = row0 + ld_item;
+    const uint ld_tok  = tok0 + ld_item;
+
+    // compute ownership: rows {tx*4..+3, 64+tx*4..+3}, tokens {ty*4..+3, 64+ty*4..+3}
+    const uint tx = tid & 15u;
+    const uint ty = tid >> 4u;
+
+    float acc[8][8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) [[unroll]] for (uint j = 0u; j < 8u; ++j) acc[i][j] = 0.0;
+
+    const uint steps = pc.n_blocks_per_row * 2u;
+    load_step(0u, ld_row, ld_tok, ld_half);
+
+    for (uint s = 0u; s < steps; ++s) {
+        // ---- registers -> shared (decode the 16 weights) ----
+        {
+            const float sc = p_scale;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                const uint word = (j < 4u) ? p_lo : p_hi;
+                const uint bv = (word >> ((j & 3u) * 8u)) & 0xFFu;
+                const uint k = ld_half * 16u + 2u * j;
+                Ws4[k * 32u + (ld_item >> 2u)][ld_item & 3u]        = (float(bv & 0x0Fu) - 8.0) * sc;
+                Ws4[(k + 1u) * 32u + (ld_item >> 2u)][ld_item & 3u] = (float(bv >> 4u)   - 8.0) * sc;
+            }
+            [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                [[unroll]] for (uint c = 0u; c < 4u; ++c)
+                    Xs4[(ld_half * 16u + i * 4u + c) * 32u + (ld_item >> 2u)][ld_item & 3u] = p_x[i][c];
+        }
+        barrier();
+
+        // ---- issue the next step's global loads; they complete while we do the maths below ----
+        if (s + 1u < steps) load_step(s + 1u, ld_row, ld_tok, ld_half);
+
+        // ---- 8 rows x 8 tokens x 32 columns ----
+        for (uint k = 0u; k < BK; ++k) {
+            const vec4 wa = Ws4[k * 32u + tx];
+            const vec4 wb = Ws4[k * 32u + 16u + tx];
+            const vec4 xa = Xs4[k * 32u + ty];
+            const vec4 xb = Xs4[k * 32u + 16u + ty];
+            const float w[8] = float[8](wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w);
+            const float x[8] = float[8](xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
+            [[unroll]] for (uint i = 0u; i < 8u; ++i)
+                [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                    acc[i][j] += w[i] * x[j];
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+        const uint tok = tok0 + ((j < 4u) ? (ty * 4u + j) : (64u + ty * 4u + (j - 4u)));
+        if (tok >= pc.n_tokens) continue;
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            const uint r = row0 + ((i < 4u) ? (tx * 4u + i) : (64u + tx * 4u + (i - 4u)));
+            if (r < pc.out_rows) y[tok * pc.out_rows + r] = acc[i][j];
+        }
+    }
+}

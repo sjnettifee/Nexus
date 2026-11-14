@@ -1,0 +1,176 @@
+#version 450
+
+// Streaming chunked-KV self-attention for PREFILL.
+//
+// The GPU never holds the whole KV. The host uploads KV one POSITION CHUNK at a
+// time and dispatches this shader per chunk; the online-softmax state (m, l, and
+// the per-dim accumulator) lives in a PERSISTENT GPU buffer that survives between
+// dispatches, so each chunk continues the same running softmax. A final pass
+// (mode==1) divides the accumulator by l to produce the output.
+//
+// Proven bit-identical to single-shot online softmax by test_kv_stream.cpp.
+//
+// Architecture-neutral. Same f16 KV layout and GQA mapping as attn_score_batch.
+//
+// Dispatch grid: (n_q_heads, n_query, 1) — one workgroup per (head, query token),
+// same as the batched kernel. Called once per KV chunk (mode==0), then once more
+// to finalize (mode==1).
+//
+// Bindings (set 0):
+//   0  Q      f32  [n_query × n_q_heads × head_dim]                 (read)
+//   1  Kchunk f16  packed [n_kv_heads × chunk_len × head_dim]       (read)
+//   2  Vchunk f16  packed [n_kv_heads × chunk_len × head_dim]       (read)
+//   3  Out    f32  [n_query × n_q_heads × head_dim]                 (write, mode==1)
+//   4  State  f32  [n_query × n_q_heads × (head_dim + 2)]           (read+write)
+//        layout per (qi,h): [acc_0..acc_{hd-1}, m, l]
+//
+// State must be ZEROED by the host before the first chunk (m=-inf, l=0, acc=0).
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint  n_q_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  n_query;
+    uint  q_base_pos;       // absolute position of query token 0
+    uint  chunk_start;      // absolute position of this chunk's first key
+    uint  chunk_len;        // number of keys in this chunk
+    uint  mode;             // 0 = accumulate this chunk, 1 = finalize (normalize)
+    float scale;
+    float softcap;          // 0 = disabled
+    uint  pad0;
+    uint  pad1;
+};
+
+layout(set=0, binding=0) readonly  buffer QBuf   { float q[];        };
+layout(set=0, binding=1) readonly  buffer KBuf   { uint  k_packed[]; };
+layout(set=0, binding=2) readonly  buffer VBuf   { uint  v_packed[]; };
+layout(set=0, binding=3) writeonly buffer OutBuf { float out_data[]; };
+layout(set=0, binding=4)           buffer StBuf  { float state[];    };
+
+shared float sh[128];
+
+#define MAX_CHUNKS 8u    // head_dim up to 1024 with 128 lanes
+
+float unpack_f16(uint packed, uint which) {
+    uint h   = (which == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+    uint sgn = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1Fu;
+    uint man =  h & 0x3FFu;
+    uint f32;
+    if (exp == 0u) {
+        if (man == 0u) { f32 = sgn << 31u; }
+        else {
+            uint cnt = 0u, m = man;
+            while ((m & 0x400u) == 0u) { cnt++; m <<= 1u; }
+            f32 = (sgn << 31u) | ((113u - cnt) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 31u) {
+        f32 = (sgn << 31u) | 0x7F800000u | (man << 13u);
+    } else {
+        f32 = (sgn << 31u) | ((exp + 112u) << 23u) | (man << 13u);
+    }
+    return uintBitsToFloat(f32);
+}
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint qi = gl_WorkGroupID.y;
+    uint t  = gl_LocalInvocationID.x;
+    if (h >= n_q_heads || qi >= n_query) return;
+
+    uint chunks   = (head_dim + 127u) / 128u;
+    if (chunks > MAX_CHUNKS) chunks = MAX_CHUNKS;
+    uint q_row    = (qi * n_q_heads + h) * head_dim;
+    uint st_base  = (qi * n_q_heads + h) * (head_dim + 2u);
+
+    // ── Finalize pass: out = acc / l ────────────────────────────────────────
+    if (mode == 1u) {
+        float l = state[st_base + head_dim + 1u];
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            if (d < head_dim)
+                out_data[q_row + d] = (l > 0.0) ? state[st_base + d] / l : 0.0;
+        }
+        return;
+    }
+
+    // ── Accumulate pass over this chunk's keys ──────────────────────────────
+    uint q_pos = q_base_pos + qi;
+
+    // This query only attends to keys at absolute pos <= q_pos (causal). Skip
+    // chunks entirely beyond this query; clamp the in-chunk range otherwise.
+    if (chunk_start > q_pos) return;                 // whole chunk is future
+    uint local_last = q_pos - chunk_start;           // last local idx allowed
+    if (local_last >= chunk_len) local_last = chunk_len - 1u;
+
+    uint kv_h = h * n_kv_heads / n_q_heads;
+    uint k_head_base = kv_h * chunk_len * head_dim;   // chunk-local base
+
+    // Load this lane's Q dims.
+    float qv[MAX_CHUNKS];
+    for (uint c = 0u; c < MAX_CHUNKS; ++c) qv[c] = 0.0;
+    for (uint c = 0u; c < chunks; ++c) {
+        uint d = t + c * 128u;
+        if (d < head_dim) qv[c] = q[q_row + d];
+    }
+
+    // Load running state for this (qi,h).
+    float m = state[st_base + head_dim];
+    float l = state[st_base + head_dim + 1u];
+    float acc[MAX_CHUNKS];
+    for (uint c = 0u; c < MAX_CHUNKS; ++c) {
+        uint d = t + c * 128u;
+        acc[c] = (d < head_dim) ? state[st_base + d] : 0.0;
+    }
+
+    for (uint lp = 0u; lp <= local_last; ++lp) {
+        float partial = 0.0;
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            if (d < head_dim) {
+                uint elem = k_head_base + lp * head_dim + d;
+                partial += qv[c] * unpack_f16(k_packed[elem >> 1u], elem & 1u);
+            }
+        }
+        sh[t] = partial;
+        barrier();
+        if (t < 64u) sh[t] += sh[t + 64u]; barrier();
+        if (t < 32u) sh[t] += sh[t + 32u]; barrier();
+        if (t < 16u) sh[t] += sh[t + 16u]; barrier();
+        if (t <  8u) sh[t] += sh[t +  8u]; barrier();
+        if (t <  4u) sh[t] += sh[t +  4u]; barrier();
+        if (t <  2u) sh[t] += sh[t +  2u]; barrier();
+        if (t <  1u) sh[0]  = sh[0] + sh[1]; barrier();
+
+        float score = sh[0] * scale;
+        if (softcap > 0.0) score = softcap * tanh(score / softcap);
+
+        float m_new = max(m, score);
+        float corr  = exp(m - m_new);
+        float w     = exp(score - m_new);
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            float vv = 0.0;
+            if (d < head_dim) {
+                uint elem = k_head_base + lp * head_dim + d;
+                vv = unpack_f16(v_packed[elem >> 1u], elem & 1u);
+            }
+            acc[c] = acc[c] * corr + w * vv;
+        }
+        l = l * corr + w;
+        m = m_new;
+        barrier();
+    }
+
+    // Write running state back.
+    for (uint c = 0u; c < chunks; ++c) {
+        uint d = t + c * 128u;
+        if (d < head_dim) state[st_base + d] = acc[c];
+    }
+    if (t == 0u) {
+        state[st_base + head_dim]      = m;
+        state[st_base + head_dim + 1u] = l;
+    }
+}

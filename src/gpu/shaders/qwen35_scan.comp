@@ -1,0 +1,153 @@
+// nexus/src/gpu/shaders/qwen35_scan.comp
+// Qwen3Next/GatedDeltaNet recurrent scan for full-prompt prefill.
+// One workgroup owns one value head. local invocation j owns state column j.
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer ConvBuf  { float conv[];  };
+layout(set = 0, binding = 1) readonly  buffer ABuf     { float avec[];  };
+layout(set = 0, binding = 2) readonly  buffer BBuf     { float bvec[];  };
+layout(set = 0, binding = 3) readonly  buffer ZBuf     { float zvec[];  };
+layout(set = 0, binding = 4) readonly  buffer ALogBuf  { float A_log[]; };
+layout(set = 0, binding = 5) readonly  buffer DtBuf    { float dt[];    };
+layout(set = 0, binding = 6) readonly  buffer NormBuf  { float normw[]; };
+layout(set = 0, binding = 7) buffer StateBuf           { float state[]; };
+layout(set = 0, binding = 8) writeonly buffer CoreBuf  { float core[];  };
+
+layout(push_constant) uniform PC {
+    uint n_tokens;
+    uint conv_dim;
+    uint key_dim;
+    uint value_dim;
+    uint kh;
+    uint vh;
+    uint hd;
+    uint repeat;
+    uint grouped;
+    float eps;
+} pc;
+
+shared float sh_q[256];
+shared float sh_k[256];
+shared float sh_tmp[256];
+shared float sh_dst[256];
+
+float sigmoid_safe(float x) {
+    if (x > 80.0) return 1.0;
+    if (x < -80.0) return 0.0;
+    return 1.0 / (1.0 + exp(-x));
+}
+
+float softplus_safe(float x) {
+    if (x > 40.0) return x;
+    if (x < -40.0) return exp(x);
+    return log(1.0 + exp(x));
+}
+
+float silu_safe(float x) {
+    return x * sigmoid_safe(x);
+}
+
+float reduce_sum(float v, uint lid) {
+    sh_tmp[lid] = v;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) sh_tmp[lid] += sh_tmp[lid + stride];
+        barrier();
+    }
+    float r = sh_tmp[0];
+    // Every lane must finish reading sh_tmp[0] before the next reduce_sum()
+    // overwrites sh_tmp[]. Without this barrier a fast lane races ahead and
+    // clobbers sh_tmp[0] (lane 0's write) before slow lanes read it -> the
+    // q/k/ss norms come out wrong at random.
+    barrier();
+    return r;
+}
+
+void main() {
+    uint hv = gl_WorkGroupID.x;
+    uint j  = gl_LocalInvocationID.x;
+    if (hv >= pc.vh) return;
+
+    uint hd = pc.hd;
+    if (hd == 0u || hd > 256u || pc.repeat == 0u) return;
+
+    uint hk = hv / pc.repeat;
+    uint rr = hv - hk * pc.repeat;
+
+    for (uint t = 0u; t < pc.n_tokens; ++t) {
+        uint qoff;
+        uint koff;
+        uint voff;
+
+        if (pc.grouped != 0u) {
+            uint group_span = 2u * hd + pc.repeat * hd;
+            uint base = t * pc.conv_dim + hk * group_span;
+            qoff = base;
+            koff = base + hd;
+            voff = base + 2u * hd + rr * hd;
+        } else {
+            uint base = t * pc.conv_dim;
+            qoff = base + hk * hd;
+            koff = base + pc.key_dim + hk * hd;
+            voff = base + 2u * pc.key_dim + hv * hd;
+        }
+
+        float qj = (j < hd) ? conv[qoff + j] : 0.0;
+        float kj = (j < hd) ? conv[koff + j] : 0.0;
+        sh_q[j] = qj;
+        sh_k[j] = kj;
+        barrier();
+
+        float qss = reduce_sum((j < hd) ? qj * qj : 0.0, j);
+        float kss = reduce_sum((j < hd) ? kj * kj : 0.0, j);
+        float qinv = inversesqrt(qss + 1.0e-6);
+        float kinv = inversesqrt(kss + 1.0e-6);
+
+        float beta = sigmoid_safe(bvec[t * pc.vh + hv]);
+        float g = A_log[hv] * softplus_safe(avec[t * pc.vh + hv] + dt[hv]);
+        if (isnan(g) || isinf(g)) g = -60.0;
+        if (g > 0.0) g = 0.0;
+        if (g < -60.0) g = -60.0;
+        float decay = exp(g);
+        float scale = inversesqrt(float(hd));
+
+        float raw = 0.0;
+        if (j < hd) {
+            uint state_base = hv * hd * hd;
+            float kv_mem = 0.0;
+            for (uint i = 0u; i < hd; ++i) {
+                float kval = sh_k[i] * kinv;
+                uint idx = state_base + i * hd + j;
+                float s = state[idx] * decay;
+                state[idx] = s;
+                kv_mem += kval * s;
+            }
+
+            float vj = conv[voff + j];
+            float delta = (vj - kv_mem) * beta;
+
+            for (uint i = 0u; i < hd; ++i) {
+                float kval = sh_k[i] * kinv;
+                uint idx = state_base + i * hd + j;
+                state[idx] += kval * delta;
+            }
+
+            for (uint i = 0u; i < hd; ++i) {
+                float qval = sh_q[i] * qinv * scale;
+                raw += qval * state[state_base + i * hd + j];
+            }
+        }
+
+        sh_dst[j] = (j < hd) ? raw : 0.0;
+        barrier();
+        float ss = reduce_sum((j < hd) ? raw * raw : 0.0, j);
+        float rinv = inversesqrt(ss / float(hd) + pc.eps);
+
+        if (j < hd) {
+            float zg = zvec[t * pc.value_dim + hv * hd + j];
+            core[t * pc.value_dim + hv * hd + j] = raw * rinv * normw[j] * silu_safe(zg);
+        }
+        barrier();
+    }
+}

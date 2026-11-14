@@ -1,0 +1,97 @@
+// nexus/src/gpu/shaders/mat_vec_q3k.comp — GGUF Q3_K, token generation (matrix x vector), v3 design (see mat_vec_q4k.comp)
+//
+// Q3_K block = 256 weights = 110 bytes (2-byte aligned only): hmask[32] | qs[64] (low 2 bits) | scales[12] (16 six-bit scales) | d (f16 at byte 108).
+// Step s = 0..7 covers 32 weights: n = s/4, j = s%4;  weight c (0..31) = ((qs[32n + c] >> 2j) & 3) - (hmask[c] bit s ? 0 : 4), scale index 2s + c/16, value d*(sc-32)*q.
+// Thread t of a pass: superblock sb = t/16, part = t%16, s = part/2, h = part%2 -> 16 weights.  16 rows per workgroup, 128 threads.
+// DISPATCH: ceil(out_rows / ROWS) workgroups.  in_cols must be a multiple of 256.  Push constants: out_rows, in_cols, n_blocks_per_row (= in_cols/256), pad
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer InputBuf   { float x_in[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];    };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    float pad;
+} pc;
+
+#ifndef ROWS
+#define ROWS 8
+#endif
+
+shared float red[ROWS * 128];
+
+float f16_to_f32(uint h){ return unpackHalf2x16(h & 0xFFFFu).x; }
+
+uint last_word;
+uint ld32(uint o) {                 // 4 bytes at even byte offset o
+    const uint w = o >> 2u;
+    const uint a = W[w];
+    if ((o & 2u) == 0u) return a;
+    return (a >> 16u) | (W[min(w + 1u, last_word)] << 16u);
+}
+uint ld8(uint o) { return (W[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * uint(ROWS);
+    const uint nb   = pc.n_blocks_per_row;
+    last_word = (pc.out_rows * nb * 110u + 3u) / 4u - 1u;
+    const uint sb   = tid >> 4u;
+    const uint part = tid & 15u;
+    const uint s    = part >> 1u;
+    const uint h    = part & 1u;
+    const uint n    = s >> 2u;
+    const uint sh   = 2u * (s & 3u);
+    const uint idx  = 2u * s + h;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) acc[r] = 0.0;
+
+    for (uint pb = 0u; pb < nb; pb += 8u) {
+        const uint b = pb + sb;
+        if (b < nb) {
+            const uint xb = b * 256u + s * 32u + h * 16u;
+            float xr[16];
+            [[unroll]] for (uint k = 0u; k < 16u; ++k) xr[k] = x_in[xb + k];
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) {
+                const uint row = row0 + r;
+                if (row < pc.out_rows) {
+                    const uint bo = (row * nb + b) * 110u;
+                    const uint lo = (idx < 8u) ? (ld8(bo + 96u + idx) & 15u) : (ld8(bo + 96u + idx - 8u) >> 4u);
+                    const uint hi = (ld8(bo + 104u + (idx & 3u)) >> (2u * (idx >> 2u))) & 3u;
+                    const float d = f16_to_f32(ld8(bo + 108u) | (ld8(bo + 109u) << 8u));
+                    const float sc = d * float(int(lo | (hi << 4u)) - 32);
+                    float dq = 0.0;
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                        const uint qw = ld32(bo + 32u + 32u * n + 16u * h + 4u * i);
+                        const uint hw = ld32(bo + 16u * h + 4u * i);
+                        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                            const int q = int((qw >> (8u * k + sh)) & 3u) - (((hw >> (8u * k + s)) & 1u) != 0u ? 0 : 4);
+                            dq += float(q) * xr[4u * i + k];
+                        }
+                    }
+                    acc[r] += sc * dq;
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] = acc[r];
+    barrier();
+    for (uint st = 64u; st > 0u; st >>= 1u) {
+        if (tid < st) {
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] += red[r * 128u + tid + st];
+        }
+        barrier();
+    }
+    if (tid < uint(ROWS)) {
+        const uint row = row0 + tid;
+        if (row < pc.out_rows) y[row] = red[tid * 128u];
+    }
+}

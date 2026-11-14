@@ -1,0 +1,147 @@
+#version 450
+
+// Grouped-query self-attention  —  single-token (autoregressive) decode.
+//
+// One workgroup per query head.  128 threads per workgroup.  Each lane owns head dims
+// t, t+128, t+256, ... so head_dim 256 (Qwen3.5/3.6, Gemma) and up to 1024 are fully covered.
+// (The previous version handled only dims 0..127 and silently dropped the rest, which gave
+//  wrong attention on every model with head_dim > 128 as soon as a layer ran on a graphics card.)
+//
+// Online softmax (Flash-Attention style): O(1) shared memory regardless of
+// context length — no "store all n_ctx scores" buffer needed.
+//
+// Bindings (set 0):
+//   0  Q      f32  [n_q_heads × head_dim]
+//   1  K      f16  packed pairs in uint32  [n_kv_heads × n_ctx × head_dim]
+//   2  V      f16  packed pairs in uint32  [n_kv_heads × n_ctx × head_dim]
+//   3  Out    f32  [n_q_heads × head_dim]
+//
+// Push constants: n_q_heads, n_kv_heads, head_dim, n_ctx, scale(=1/√hd), pad[3]
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint  n_q_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  n_ctx;
+    float scale;
+    uint  pad[3];
+};
+
+layout(set=0, binding=0) readonly buffer QBuf   { float  q[];        };
+layout(set=0, binding=1) readonly buffer KBuf   { uint   k_packed[]; };
+layout(set=0, binding=2) readonly buffer VBuf   { uint   v_packed[]; };
+layout(set=0, binding=3)          buffer OutBuf { float  out_data[]; };
+
+// Shared scratch for parallel dot-product reduction (128 elements).
+shared float sh[128];
+
+// ---------------------------------------------------------------------------
+// Unpack one IEEE-754 half-float from a packed uint32.
+//   which == 0  →  low  16 bits  (first  f16 in the pair)
+//   which == 1  →  high 16 bits  (second f16 in the pair)
+// Handles normals, denormals, ±zero, ±inf, NaN.
+// ---------------------------------------------------------------------------
+float unpack_f16(uint packed, uint which) {
+    uint h   = (which == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+    uint sgn = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1Fu;
+    uint man =  h & 0x3FFu;
+    uint f32;
+    if (exp == 0u) {
+        if (man == 0u) {
+            f32 = sgn << 31u;                        // ±zero
+        } else {
+            // Denormal: normalise by counting leading zeros in mantissa
+            uint cnt = 0u, m = man;
+            while ((m & 0x400u) == 0u) { cnt++; m <<= 1u; }
+            f32 = (sgn << 31u) | ((113u - cnt) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 31u) {
+        f32 = (sgn << 31u) | 0x7F800000u | (man << 13u); // ±inf / NaN
+    } else {
+        f32 = (sgn << 31u) | ((exp + 112u) << 23u) | (man << 13u); // normal
+    }
+    return uintBitsToFloat(f32);
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;        // query-head index [0, n_q_heads)
+    uint t = gl_LocalInvocationID.x;  // lane [0, 127]
+
+    // All invocations in this workgroup share the same h; the early-out
+    // is uniform so no barrier divergence occurs.
+    if (h >= n_q_heads || n_ctx == 0u) return;
+
+    // GQA: map query head -> kv head
+    uint kv_h   = h * n_kv_heads / n_q_heads;
+
+    uint q_base = h    * head_dim;
+    uint k_base = kv_h * n_ctx * head_dim;
+
+    uint chunks = (head_dim + 127u) / 128u;    // dims handled by each lane (1 for hd<=128, 2 for 256, ...)
+
+    float qv[8];
+    float acc[8];
+    for (uint c = 0u; c < 8u; ++c) { qv[c] = 0.0; acc[c] = 0.0; }
+    for (uint c = 0u; c < chunks; ++c) {
+        uint d = t + c * 128u;
+        if (d < head_dim) qv[c] = q[q_base + d];
+    }
+
+    // Online-softmax state (same for all lanes)
+    float m = -1e30;    // running maximum of scores
+    float l = 0.0;      // running sum of exp weights
+
+    for (uint pos = 0u; pos < n_ctx; ++pos) {
+
+        // Step 1: this lane's partial dot-product over its dims
+        float part = 0.0;
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            if (d < head_dim) {
+                uint elem = k_base + pos * head_dim + d;
+                part += qv[c] * unpack_f16(k_packed[elem >> 1u], elem & 1u);
+            }
+        }
+        sh[t] = part;
+        barrier();
+
+        // Step 2: parallel reduction -> sh[0] = dot(q, k[pos])
+        if (t < 64u) sh[t] += sh[t + 64u]; barrier();
+        if (t < 32u) sh[t] += sh[t + 32u]; barrier();
+        if (t < 16u) sh[t] += sh[t + 16u]; barrier();
+        if (t <  8u) sh[t] += sh[t +  8u]; barrier();
+        if (t <  4u) sh[t] += sh[t +  4u]; barrier();
+        if (t <  2u) sh[t] += sh[t +  2u]; barrier();
+        if (t <  1u) sh[0]  = sh[0] + sh[1]; barrier();
+
+        float score = sh[0] * scale;   // all lanes see the same value
+        barrier();                     // everyone has read sh[0] before the next position overwrites sh[]
+
+        // Step 3: online softmax update
+        float m_new = max(m, score);
+        float corr  = exp(m - m_new);
+        float w     = exp(score - m_new);
+
+        // Step 4: accumulate V for each of this lane's dims
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            float v_val = 0.0;
+            if (d < head_dim) {
+                uint elem = k_base + pos * head_dim + d;   // V uses the same [kv_h][pos][d] layout as K
+                v_val = unpack_f16(v_packed[elem >> 1u], elem & 1u);
+            }
+            acc[c] = acc[c] * corr + w * v_val;
+        }
+        l = l * corr + w;
+        m = m_new;
+    }
+
+    // Write normalised output
+    for (uint c = 0u; c < chunks; ++c) {
+        uint d = t + c * 128u;
+        if (d < head_dim) out_data[h * head_dim + d] = (l > 0.0) ? acc[c] / l : 0.0;
+    }
+}

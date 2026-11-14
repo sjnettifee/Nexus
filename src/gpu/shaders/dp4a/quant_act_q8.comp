@@ -1,0 +1,43 @@
+// nexus/src/gpu/shaders/quant_act_q8.comp -- quantise prompt activations to int8 for the dp4a matrix kernel
+//
+// x  : f32 [n_blocks * 32]            (token-major rows; in_cols % 32 == 0, so blocks never straddle tokens)
+// xq : uint [n_blocks * 8]            int8 values packed 4 per word.  Within each 8-element group the order is permuted:
+//                                     word 2g   = elements (8g+0, 8g+2, 8g+4, 8g+6),  word 2g+1 = elements (8g+1, 8g+3, 8g+5, 8g+7)
+//                                     (this matches how mat_mat_nq4_g64_dp4a unpacks weight nibbles without any shuffling)
+// xs : f32 [n_blocks]                 scale per 32 values: x ~= q * scale, q in [-127, 127]
+// Dispatch: ceil(n_blocks / 256) groups.  Push constants: n_blocks.
+
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer XBuf  { vec4 x4[];  };
+layout(set = 0, binding = 1) writeonly buffer QBuf  { uint xq[];  };
+layout(set = 0, binding = 2) writeonly buffer SBuf  { float xs[]; };
+
+layout(push_constant) uniform PC { uint n_blocks; uint p0; uint p1; uint p2; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_blocks) return;
+    float v[32];
+    float amax = 0.0;
+    for (uint k = 0u; k < 8u; ++k) {
+        const vec4 a = x4[i * 8u + k];
+        v[4u * k] = a.x; v[4u * k + 1u] = a.y; v[4u * k + 2u] = a.z; v[4u * k + 3u] = a.w;
+        amax = max(amax, max(max(abs(a.x), abs(a.y)), max(abs(a.z), abs(a.w))));
+    }
+    const float scale = amax / 127.0;
+    const float inv = (amax > 0.0) ? 127.0 / amax : 0.0;
+    xs[i] = scale;
+    for (uint g = 0u; g < 4u; ++g) {
+        uint ev = 0u, od = 0u;
+        for (uint e = 0u; e < 4u; ++e) {
+            const int qe = clamp(int(roundEven(v[8u * g + 2u * e] * inv)),      -127, 127);
+            const int qo = clamp(int(roundEven(v[8u * g + 2u * e + 1u] * inv)), -127, 127);
+            ev |= (uint(qe) & 0xFFu) << (8u * e);
+            od |= (uint(qo) & 0xFFu) << (8u * e);
+        }
+        xq[i * 8u + 2u * g]      = ev;
+        xq[i * 8u + 2u * g + 1u] = od;
+    }
+}

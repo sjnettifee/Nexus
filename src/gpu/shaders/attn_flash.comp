@@ -1,0 +1,218 @@
+// nexus/src/gpu/shaders/attn_flash.comp -- tiled causal attention for PROMPT reading (flash-attention style)
+//
+// The old prompt kernels gave every (head, query) pair its own workgroup that walked the keys one at a time with 7 barriers per
+// key and re-read the whole K/V from host memory for every query.  This kernel handles a 64-query x 64-key tile per workgroup:
+//   S = Q K^T   (64x64, 4x4 register tile per thread, Q/K staged through shared memory 32 dims at a time)
+//   online softmax per query row (running max m, running sum l, rescale factor corr)
+//   O += P V    (each thread owns 4 queries x hd/16 dims of the output, V staged 16 keys at a time)
+// K and V are read once per 64 queries instead of once per query, and live in VRAM (uploaded once per layer by the host).
+//
+// Layout (same as the other attention kernels): Q f32 [n_query][n_q_heads][hd];  K,V f16 packed in uint [n_kv_heads][n_ctx][hd];
+// Out f32 [n_query][n_q_heads][hd].  GQA: kv head = h * n_kv_heads / n_q_heads.  Causal with absolute positions
+// (query i is at q_base_pos + i), optional sliding window, optional logit softcap (0 = off).
+// Supported: head_dim % 64 == 0 and head_dim <= 256.  Dispatch: (ceil(n_query / 64), n_q_heads, 1).
+
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  n_q_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  n_ctx;
+    uint  n_query;
+    uint  q_base_pos;
+    uint  sliding_window;
+    uint  pad0;
+    float scale;
+    float softcap;
+    uint  pad1;
+    uint  pad2;
+};
+
+layout(set = 0, binding = 0) readonly  buffer QBuf   { float q_in[];     };
+layout(set = 0, binding = 1) readonly  buffer KBuf   { uint  k_packed[]; };
+layout(set = 0, binding = 2) readonly  buffer VBuf   { uint  v_packed[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_data[]; };
+
+const uint BQ = 64u;
+const uint BK = 64u;
+const uint DC = 32u;     // dims per Q/K staging step
+
+shared vec4  regA[1024];     // phase 1: Qs4[0..511] + Ks4[512..1023];  phase 2: V sub-tile [16 keys][hd/4]
+shared vec4  Ps4[1024];      // [key][query/4]  scores, then probabilities
+shared float m_row[BQ];
+shared float l_row[BQ];
+shared float corr_row[BQ];
+shared float red_a[256];
+shared float red_b[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h   = gl_WorkGroupID.y;
+    const uint q0  = gl_WorkGroupID.x * BQ;
+    const uint hd  = head_dim;
+    const uint kvh = h * n_kv_heads / n_q_heads;
+    const uint nv  = hd / 64u;                 // vec4 output groups per thread (1..4)
+
+    const uint tx = tid & 15u;                 // phase 1: keys    tx*4 .. +3     phase 2: vec4 dim group
+    const uint ty = tid >> 4u;                 //          queries ty*4 .. +3
+
+    if (tid < BQ) { m_row[tid] = -1e30; l_row[tid] = 0.0; corr_row[tid] = 1.0; }
+
+    vec4 oacc[4][4];
+    for (uint i = 0u; i < 4u; ++i) for (uint j = 0u; j < 4u; ++j) oacc[i][j] = vec4(0.0);
+
+    // key range this block of queries can see
+    const uint q_last_abs = q_base_pos + min(q0 + BQ, n_query) - 1u;
+    const uint q_first_abs = q_base_pos + q0;
+    uint kmin = 0u;
+    if (sliding_window > 0u && q_first_abs + 1u > sliding_window) kmin = q_first_abs + 1u - sliding_window;
+    const uint kmax = min(q_last_abs, n_ctx - 1u);        // inclusive
+    const uint kstart = (kmin / BK) * BK;
+
+    // staging ownership (phase 1 loads): item = tid>>2 (a query row or a key row), part = tid&3 -> 8 dims
+    const uint ld_item = tid >> 2u;
+    const uint ld_part = (tid & 3u) * 8u;
+    const uint ld_q    = q0 + ld_item;
+    const uint q_row_ld = (ld_q * n_q_heads + h) * hd;
+
+    barrier();
+
+    for (uint k0 = kstart; k0 <= kmax; k0 += BK) {
+        // ---------------- phase 1: S = Q K^T ----------------
+        float s[4][4];
+        for (uint i = 0u; i < 4u; ++i) for (uint j = 0u; j < 4u; ++j) s[i][j] = 0.0;
+
+        const uint kpos_ld = k0 + ld_item;
+        const uint k_base_ld = (kvh * n_ctx + kpos_ld) * (hd >> 1u);
+
+        for (uint d0 = 0u; d0 < hd; d0 += DC) {
+            // Q chunk -> regA[d*16 + q/4][q&3]
+            for (uint j = 0u; j < 8u; ++j) {
+                const uint d = d0 + ld_part + j;
+                const float v = (ld_q < n_query) ? q_in[q_row_ld + d] : 0.0;
+                regA[(ld_part + j) * 16u + (ld_item >> 2u)][ld_item & 3u] = v;
+            }
+            // K chunk -> regA[512 + d*16 + key/4][key&3]
+            for (uint j = 0u; j < 4u; ++j) {
+                vec2 f = vec2(0.0);
+                if (kpos_ld < n_ctx) f = unpackHalf2x16(k_packed[k_base_ld + ((d0 + ld_part) >> 1u) + j]);
+                regA[512u + (ld_part + 2u * j) * 16u + (ld_item >> 2u)][ld_item & 3u] = f.x;
+                regA[512u + (ld_part + 2u * j + 1u) * 16u + (ld_item >> 2u)][ld_item & 3u] = f.y;
+            }
+            barrier();
+            for (uint d = 0u; d < DC; ++d) {
+                const vec4 qv = regA[d * 16u + ty];
+                const vec4 kv = regA[512u + d * 16u + tx];
+                s[0][0] += qv.x * kv.x; s[0][1] += qv.x * kv.y; s[0][2] += qv.x * kv.z; s[0][3] += qv.x * kv.w;
+                s[1][0] += qv.y * kv.x; s[1][1] += qv.y * kv.y; s[1][2] += qv.y * kv.z; s[1][3] += qv.y * kv.w;
+                s[2][0] += qv.z * kv.x; s[2][1] += qv.z * kv.y; s[2][2] += qv.z * kv.z; s[2][3] += qv.z * kv.w;
+                s[3][0] += qv.w * kv.x; s[3][1] += qv.w * kv.y; s[3][2] += qv.w * kv.z; s[3][3] += qv.w * kv.w;
+            }
+            barrier();
+        }
+
+        // scores -> shared, layout Ps4[key*16 + q/4] = (q0..q3 of that key)
+        for (uint j = 0u; j < 4u; ++j)
+            Ps4[(tx * 4u + j) * 16u + ty] = vec4(s[0][j], s[1][j], s[2][j], s[3][j]);
+        barrier();
+
+        // ---------------- online softmax: 4 threads per query row, 16 keys each ----------------
+        {
+            const uint r    = tid & 63u;
+            const uint part = tid >> 6u;
+            const uint qabs = q_base_pos + q0 + r;
+            float lmax = -1e30;
+            for (uint kk = 0u; kk < 16u; ++kk) {
+                const uint key = part * 16u + kk;
+                const uint kabs = k0 + key;
+                float v = Ps4[key * 16u + (r >> 2u)][r & 3u] * scale;
+                if (softcap > 0.0) v = softcap * tanh(v / softcap);
+                bool ok = (kabs <= qabs) && (kabs < n_ctx);
+                if (sliding_window > 0u && qabs + 1u > sliding_window && kabs < qabs + 1u - sliding_window) ok = false;
+                if (!ok) v = -1e30;
+                Ps4[key * 16u + (r >> 2u)][r & 3u] = v;
+                lmax = max(lmax, v);
+            }
+            red_a[part * 64u + r] = lmax;
+            barrier();
+            const float m_old = m_row[r];
+            const float m_new = max(m_old, max(max(red_a[r], red_a[64u + r]), max(red_a[128u + r], red_a[192u + r])));
+            float lsum = 0.0;
+            for (uint kk = 0u; kk < 16u; ++kk) {
+                const uint key = part * 16u + kk;
+                const float v = Ps4[key * 16u + (r >> 2u)][r & 3u];
+                const float p = (v > -1e29) ? exp(v - m_new) : 0.0;
+                Ps4[key * 16u + (r >> 2u)][r & 3u] = p;
+                lsum += p;
+            }
+            red_b[part * 64u + r] = lsum;
+            barrier();
+            if (part == 0u) {
+                const float corr = exp(m_old - m_new);
+                l_row[r] = l_row[r] * corr + (red_b[r] + red_b[64u + r] + red_b[128u + r] + red_b[192u + r]);
+                m_row[r] = m_new;
+                corr_row[r] = corr;
+            }
+            barrier();
+        }
+
+        // ---------------- phase 2: O = O * corr + P V ----------------
+        {
+            const vec4 c4 = vec4(corr_row[ty * 4u], corr_row[ty * 4u + 1u], corr_row[ty * 4u + 2u], corr_row[ty * 4u + 3u]);
+            for (uint i = 0u; i < 4u; ++i)
+                for (uint j = 0u; j < 4u; ++j) oacc[i][j] *= c4[i];   // constant bounds: accumulators stay in registers
+        }
+        for (uint sub = 0u; sub < 4u; ++sub) {
+            // V sub-tile: 16 keys x hd  -> regA[key*(hd/4) + g]
+            {
+                const uint key = tid >> 4u;
+                const uint kpos = k0 + sub * 16u + key;
+                const uint vb = (kvh * n_ctx + kpos) * (hd >> 1u);
+                for (uint i2 = 0u; i2 < 4u; ++i2) {
+                    if (i2 >= nv) break;
+                    const uint g = (tid & 15u) + 16u * i2;
+                    vec4 v = vec4(0.0);
+                    if (kpos < n_ctx) {
+                        const vec2 a = unpackHalf2x16(v_packed[vb + 2u * g]);
+                        const vec2 b = unpackHalf2x16(v_packed[vb + 2u * g + 1u]);
+                        v = vec4(a.x, a.y, b.x, b.y);
+                    }
+                    regA[key * (hd >> 2u) + g] = v;
+                }
+            }
+            barrier();
+            for (uint kk = 0u; kk < 16u; ++kk) {
+                const vec4 p = Ps4[(sub * 16u + kk) * 16u + ty];
+                for (uint j = 0u; j < 4u; ++j) {
+                    if (j < nv) {
+                        const vec4 v = regA[kk * (hd >> 2u) + tx + 16u * j];
+                        oacc[0][j] += p.x * v;
+                        oacc[1][j] += p.y * v;
+                        oacc[2][j] += p.z * v;
+                        oacc[3][j] += p.w * v;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        const uint ql = q0 + ty * 4u + i;
+        if (ql >= n_query) continue;
+        const float l = l_row[ty * 4u + i];
+        const float inv = (l > 0.0) ? 1.0 / l : 0.0;
+        const uint ob = (ql * n_q_heads + h) * hd;
+        for (uint j = 0u; j < 4u; ++j) {
+            if (j >= nv) break;
+            const vec4 o = oacc[i][j] * inv;
+            const uint d = (tx + 16u * j) * 4u;
+            out_data[ob + d]      = o.x;
+            out_data[ob + d + 1u] = o.y;
+            out_data[ob + d + 2u] = o.z;
+            out_data[ob + d + 3u] = o.w;
+        }
+    }
+}

@@ -1,0 +1,96 @@
+// nexus/src/gpu/shaders/mat_vec_nq6_g64.comp — Nexus native NQ6_G64, token generation (matrix x vector), v3 design (see mat_vec_nq4_g64.comp)
+// Record = 2 + 8*6 = 50 bytes per 64 weights: f16 scale, then 64 6-bit values packed LSB-first.  w = (q - 32) * scale.
+// 4 threads per record, 16 weights each (a byte-aligned slice of 2*6 bytes); 32 records (2048 columns) per pass; 16 rows per workgroup.
+// DISPATCH: ceil(out_rows / ROWS) workgroups (Pipeline::rows_per_group must equal ROWS).  Push constants: out_rows, in_cols, n_blocks_per_row, pad
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer InputBuf   { float x_in[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];    };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    float pad;
+} pc;
+
+#define NQ_BITS 6
+#define REC_BYTES 50u
+#define NWORDS 3
+#ifndef ROWS
+#define ROWS 16
+#endif
+
+shared float red[ROWS * 128];
+
+float f16_to_f32(uint h){ return unpackHalf2x16(h & 0xFFFFu).x; }
+
+uint last_word;
+uint ld32(uint o) {                 // 4 bytes at even byte offset o
+    const uint w = o >> 2u;
+    const uint a = W[min(w, last_word)];
+    if ((o & 2u) == 0u) return a;
+    return (a >> 16u) | (W[min(w + 1u, last_word)] << 16u);
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * uint(ROWS);
+    const uint nb   = pc.n_blocks_per_row;
+    last_word = (pc.out_rows * nb * REC_BYTES + 3u) / 4u - 1u;
+    const uint bs = tid >> 2u;
+    const uint q  = tid & 3u;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) acc[r] = 0.0;
+
+    for (uint pb = 0u; pb < nb; pb += 32u) {
+        const uint b = pb + bs;
+        if (b < nb) {
+            const uint col0 = b * 64u + q * 16u;
+            float xr[16];
+            float sx = 0.0;
+            [[unroll]] for (uint k = 0u; k < 16u; ++k) {
+                float v = 0.0;
+                if (col0 + k < pc.in_cols) v = x_in[col0 + k];
+                xr[k] = v; sx += v;
+            }
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) {
+                const uint row = row0 + r;
+                if (row < pc.out_rows) {
+                    const uint rec = (row * nb + b) * REC_BYTES;
+                    const uint o = rec + 2u + q * 12u;
+                    uint sw[NWORDS + 1];
+                    [[unroll]] for (uint i = 0u; i < uint(NWORDS); ++i) sw[i] = ld32(o + 4u * i);
+                    sw[NWORDS] = 0u;
+                    float d = 0.0;
+                    [[unroll]] for (uint k = 0u; k < 16u; ++k) {
+                        const uint bit = k * uint(NQ_BITS), wi = bit >> 5u, sh = bit & 31u;
+                        uint v = sw[wi] >> sh;
+                        if (sh + uint(NQ_BITS) > 32u) v |= sw[wi + 1u] << (32u - sh);
+                        d += float(v & 0x3fu) * xr[k];
+                    }
+                    const float scale = f16_to_f32(W[rec >> 2u] >> ((rec & 2u) * 8u));
+                    acc[r] += scale * (d - 32.0 * sx);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] = acc[r];
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] += red[r * 128u + tid + s];
+        }
+        barrier();
+    }
+    if (tid < uint(ROWS)) {
+        const uint row = row0 + tid;
+        if (row < pc.out_rows) y[row] = red[tid * 128u];
+    }
+}

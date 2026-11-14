@@ -2,18 +2,34 @@
 
 Nexus is released under the AGPLv3 (see `LICENSE`). It also bundles a
 small number of third-party components, listed below with their own
-license text, as each of their licenses requires.
+license text, as each of their licenses requires. All of them are
+permissive licenses (MIT, BSD-2-Clause, Apache-2.0, public domain) and
+compatible with the AGPLv3.
+
+| Component | Where | License |
+|---|---|---|
+| Dear ImGui 1.91.9 | launcher | MIT |
+| stb_truetype, stb_rect_pack, stb_textedit (inside Dear ImGui) | launcher | MIT or public domain |
+| Roboto Medium | launcher (embedded font) | Apache-2.0 |
+| PDF.js 3.11.174 | `web/vendor/pdfjs/` | Apache-2.0 |
+| Tesseract.js 5.1.1, tesseract.js-core 5.1.1 | `web/vendor/tesseract/` | Apache-2.0 |
+| Tesseract English data (`eng.traineddata`, 4.0.0_best_int) | `web/vendor/tesseract/lang/` | Apache-2.0 |
+| mammoth 1.8.0 | `web/vendor/` | BSD-2-Clause |
+| SheetJS xlsx 0.18.5 | `web/vendor/` | Apache-2.0 |
+| JSZip 3.10.1 | `web/vendor/` | MIT (dual-licensed MIT / GPL-3.0; used under MIT) |
 
 ---
 
 ## Dear ImGui
 
 Used in the launcher (`imgui.h`, `imgui_internal.h`, `imgui_stdlib.h`
-and the Dear ImGui sources it builds against) for the GUI.
+and the Dear ImGui sources it builds against) for the GUI. Version
+1.91.9.
 
+```
 The MIT License (MIT)
 
-Copyright (c) 2014-2018 Omar Cornut
+Copyright (c) 2014-2025 Omar Cornut
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +41,36 @@ furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## stb (bundled inside Dear ImGui)
+
+Dear ImGui includes slightly modified copies of Sean Barrett's
+`stb_truetype.h` 1.26, `stb_rect_pack.h` 1.01 and `stb_textedit.h` 1.14
+(`imstb_truetype.h`, `imstb_rectpack.h`, `imstb_textedit.h`). They are
+available under either of two licenses; Nexus uses them under the MIT
+license:
+
+```
+MIT License
+Copyright (c) 2017 Sean Barrett
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -240,6 +286,39 @@ END OF TERMS AND CONDITIONS
 ```
 
 ---
+
+## Web chat document readers (`web/vendor/`)
+
+The web chat reads documents in the browser with these unmodified
+libraries, fetched from npm and served by the Nexus server from
+`web/vendor/`. Exact versions are in `web/vendor/VERSIONS.txt`, and each
+library's own license text, with its copyright notice, is in
+`web/vendor/LICENSES/`:
+
+| File in `web/vendor/LICENSES/` | Component |
+|---|---|
+| `pdfjs-Apache-2.0.txt` | PDF.js (`pdfjs-dist`) |
+| `tesseract.js-Apache-2.0.txt` | Tesseract.js, and the Tesseract English language data |
+| `tesseract.js-core-Apache-2.0.txt` | tesseract.js-core (Tesseract compiled to WebAssembly) |
+| `mammoth-BSD-2-Clause.txt` | mammoth, Copyright (c) 2013, Michael Williamson |
+| `sheetjs-xlsx-Apache-2.0.txt` | SheetJS Community Edition (`xlsx`) |
+| `jszip-MIT-or-GPLv3.txt` | JSZip (used under MIT), Copyright (c) 2009-2016 Stuart Knightley, David Duponchel, Franz Buchinger, António Afonso |
+
+The Apache License 2.0 text above applies to the Apache-2.0 components
+as well.
+
+---
+
+## Not bundled
+
+These are used by Nexus but are not shipped with it, so their licenses
+don't need to be reproduced: the Vulkan loader and graphics drivers
+(below), Python and `numpy` (Quant Builder), `pybind11` (optional Python
+bindings, off by default), `glslang` / `glslc` (shader compilers, build
+time only), and `curl` (used only by the optional web tools).
+
+---
+
 ## Vulkan headers (build-time only, not redistributed)
 
 Vulkan support is compiled against the Vulkan headers present on the

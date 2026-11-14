@@ -1,0 +1,162 @@
+#version 450
+
+// Batched self-attention for PREFILL — processes ALL query tokens in one
+// dispatch. Architecture-neutral (no model-specific assumptions).
+//
+// This is the batched sibling of attn_score.comp. Same online-softmax math,
+// same f16 KV layout, same GQA mapping — so output is numerically identical to
+// calling the single-token kernel once per token. The only additions:
+//   1. A query dimension (gl_WorkGroupID.y) so N tokens run in one grid.
+//   2. Per-query causal cutoff: query qi (absolute pos = q_base_pos+qi) attends
+//      to keys [start .. q_pos], start handling optional sliding window.
+//   3. head_dim striding: each of the 128 lanes owns dims t, t+128, t+256, ...
+//      so head_dim 256 (and beyond, up to 1024) is fully covered. The old
+//      kernel silently dropped everything past dim 127.
+//   4. Optional logit softcap (cap==0 disables — a no-op for models without it).
+//
+// Dispatch grid:  (n_q_heads, n_query, 1)   — one workgroup per (head, token).
+//
+// Bindings (set 0):
+//   0  Q    f32  [n_query × n_q_heads × head_dim]
+//   1  K    f16  packed pairs in uint32  [n_kv_heads × n_ctx × head_dim]
+//   2  V    f16  packed pairs in uint32  [n_kv_heads × n_ctx × head_dim]
+//   3  Out  f32  [n_query × n_q_heads × head_dim]
+//
+// n_ctx is the TOTAL populated KV length for this layer (q_base_pos + n_query
+// for a fresh prefill). q_base_pos is the absolute position of query token 0.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint  n_q_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  n_ctx;            // total KV length
+    uint  n_query;          // number of query tokens in this batch
+    uint  q_base_pos;       // absolute position of query token 0
+    uint  sliding_window;   // 0 = full causal
+    uint  pad0;
+    float scale;            // 1/sqrt(head_dim) unless overridden
+    float softcap;          // 0 = disabled
+    uint  pad1;
+    uint  pad2;
+};
+
+layout(set=0, binding=0) readonly buffer QBuf   { float  q[];        };
+layout(set=0, binding=1) readonly buffer KBuf   { uint   k_packed[]; };
+layout(set=0, binding=2) readonly buffer VBuf   { uint   v_packed[]; };
+layout(set=0, binding=3)          buffer OutBuf { float  out_data[]; };
+
+shared float sh[128];
+
+// Up to 1024 head_dim with 128 lanes (8 dims per lane). Bump if ever needed.
+#define MAX_CHUNKS 8u
+
+// Identical to attn_score.comp — keep these byte-for-byte in sync.
+float unpack_f16(uint packed, uint which) {
+    uint h   = (which == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+    uint sgn = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1Fu;
+    uint man =  h & 0x3FFu;
+    uint f32;
+    if (exp == 0u) {
+        if (man == 0u) {
+            f32 = sgn << 31u;
+        } else {
+            uint cnt = 0u, m = man;
+            while ((m & 0x400u) == 0u) { cnt++; m <<= 1u; }
+            f32 = (sgn << 31u) | ((113u - cnt) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 31u) {
+        f32 = (sgn << 31u) | 0x7F800000u | (man << 13u);
+    } else {
+        f32 = (sgn << 31u) | ((exp + 112u) << 23u) | (man << 13u);
+    }
+    return uintBitsToFloat(f32);
+}
+
+void main() {
+    uint h  = gl_WorkGroupID.x;       // query head   [0, n_q_heads)
+    uint qi = gl_WorkGroupID.y;       // query token  [0, n_query)
+    uint t  = gl_LocalInvocationID.x; // lane         [0, 128)
+
+    if (h >= n_q_heads || qi >= n_query || n_ctx == 0u) return;
+
+    uint kv_h  = h * n_kv_heads / n_q_heads;   // GQA mapping
+    uint q_pos = q_base_pos + qi;              // absolute position of this query
+
+    // Causal window. Full causal => [0 .. q_pos]. SWA => last `window` positions.
+    uint start = 0u;
+    if (sliding_window > 0u && (q_pos + 1u) > sliding_window)
+        start = (q_pos + 1u) - sliding_window;
+    uint last = q_pos;
+    if (last >= n_ctx) last = n_ctx - 1u;      // clamp to populated KV
+
+    uint chunks = (head_dim + 127u) / 128u;    // dims handled by each lane
+    if (chunks > MAX_CHUNKS) chunks = MAX_CHUNKS;
+
+    uint q_row = (qi * n_q_heads + h) * head_dim;
+
+    // Preload this lane's Q dims.
+    float qv[MAX_CHUNKS];
+    for (uint c = 0u; c < MAX_CHUNKS; ++c) qv[c] = 0.0;
+    for (uint c = 0u; c < chunks; ++c) {
+        uint d = t + c * 128u;
+        if (d < head_dim) qv[c] = q[q_row + d];
+    }
+
+    // Online-softmax accumulators: m,l scalar per (head,query); acc per dim.
+    float acc[MAX_CHUNKS];
+    for (uint c = 0u; c < MAX_CHUNKS; ++c) acc[c] = 0.0;
+    float m = -1e30;
+    float l = 0.0;
+
+    uint k_head_base = kv_h * n_ctx * head_dim;
+
+    for (uint pos = start; pos <= last; ++pos) {
+        // Partial dot(q, k[pos]) for this lane's dims.
+        float partial = 0.0;
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            if (d < head_dim) {
+                uint elem = k_head_base + pos * head_dim + d;
+                partial += qv[c] * unpack_f16(k_packed[elem >> 1u], elem & 1u);
+            }
+        }
+        sh[t] = partial;
+        barrier();
+        if (t < 64u) sh[t] += sh[t + 64u]; barrier();
+        if (t < 32u) sh[t] += sh[t + 32u]; barrier();
+        if (t < 16u) sh[t] += sh[t + 16u]; barrier();
+        if (t <  8u) sh[t] += sh[t +  8u]; barrier();
+        if (t <  4u) sh[t] += sh[t +  4u]; barrier();
+        if (t <  2u) sh[t] += sh[t +  2u]; barrier();
+        if (t <  1u) sh[0]  = sh[0] + sh[1]; barrier();
+
+        float score = sh[0] * scale;
+        if (softcap > 0.0) score = softcap * tanh(score / softcap);
+
+        float m_new = max(m, score);
+        float corr  = exp(m - m_new);
+        float w     = exp(score - m_new);
+
+        for (uint c = 0u; c < chunks; ++c) {
+            uint d = t + c * 128u;
+            float vv = 0.0;
+            if (d < head_dim) {
+                uint elem = k_head_base + pos * head_dim + d;
+                vv = unpack_f16(v_packed[elem >> 1u], elem & 1u);
+            }
+            acc[c] = acc[c] * corr + w * vv;
+        }
+        l = l * corr + w;
+        m = m_new;
+        barrier();   // protect sh[] before the next iteration overwrites it
+    }
+
+    for (uint c = 0u; c < chunks; ++c) {
+        uint d = t + c * 128u;
+        if (d < head_dim)
+            out_data[q_row + d] = (l > 0.0) ? acc[c] / l : 0.0;
+    }
+}

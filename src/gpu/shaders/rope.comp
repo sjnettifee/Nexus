@@ -1,0 +1,67 @@
+// nexus/src/gpu/shaders/rope.comp — Rotary Position Embedding (in-place)
+//
+// Matches CPU rope_apply exactly:
+//   freq = 1.0 / pow(freq_base, (2*i) / head_dim)   for pair i
+//   theta = pos * freq * scale
+//   interleaved (layout 0, Llama/Mistral style):  pair i = elements (2i, 2i+1)
+//   half-split  (layout 1, NeoX/HF style: Qwen, Phi, Gemma, EXAONE, OLMo ...):  pair i = elements (i, i + head_dim/2)
+//   x0' = x0*cos - x1*sin
+//   x1' = x0*sin + x1*cos
+//
+// Dispatch: (n_q_heads + n_kv_heads) workgroups, local_size_x = head_dim/2.
+// Binding 0 = Q [n_q_heads  * head_dim] f32 (in/out)
+// Binding 1 = K [n_kv_heads * head_dim] f32 (in/out)
+
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer QBuf { float Q[]; };
+layout(set = 0, binding = 1) buffer KBuf { float K[]; };
+
+layout(push_constant) uniform PC {
+    uint  n_q_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  pos;
+    float freq_base;
+    float scale;
+    uint  rope_layout; // 0 = interleaved pairs, 1 = half-split pairs
+    uint  pad1;
+} pc;
+
+void main() {
+    uint wg   = gl_WorkGroupID.x;        // head index (Q first, then K)
+    uint pairs = pc.head_dim / 2u;
+
+    // each thread handles pairs tid, tid+64, ... so head_dim 256 (128 pairs) and above are fully rotated
+    for (uint tid = gl_LocalInvocationID.x; tid < pairs; tid += 64u) {
+    bool is_q     = (wg < pc.n_q_heads);
+    uint head_idx = is_q ? wg : (wg - pc.n_q_heads);
+    uint base     = head_idx * pc.head_dim;
+    // the two elements this pair rotates
+    uint i0 = (pc.rope_layout == 1u) ? tid         : 2u * tid;
+    uint i1 = (pc.rope_layout == 1u) ? tid + pairs : 2u * tid + 1u;
+
+    // CPU: freq = 1.0 / pow(base, (2*i) / head_dim)
+    // where loop var i goes 0..pairs-1, so 2*i goes 0,2,4,...,head_dim-2
+    // Here tid = pair index, so 2*tid = the "i" in the CPU formula
+    float pair_i   = float(tid);                          // 0,1,2,...,pairs-1
+    float exp_arg  = (2.0 * pair_i) / float(pc.head_dim); // (2*i)/head_dim
+    float freq     = 1.0 / pow(pc.freq_base, exp_arg);    // exact CPU match
+    float theta    = float(pc.pos) * freq * pc.scale;
+    float cos_t    = cos(theta);
+    float sin_t    = sin(theta);
+
+    if (is_q) {
+        float x0 = Q[base + i0];
+        float x1 = Q[base + i1];
+        Q[base + i0] = x0 * cos_t - x1 * sin_t;
+        Q[base + i1] = x0 * sin_t + x1 * cos_t;
+    } else {
+        float x0 = K[base + i0];
+        float x1 = K[base + i1];
+        K[base + i0] = x0 * cos_t - x1 * sin_t;
+        K[base + i1] = x0 * sin_t + x1 * cos_t;
+    }
+    }
+}

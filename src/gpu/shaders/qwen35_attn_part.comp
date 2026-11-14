@@ -1,0 +1,108 @@
+// qwen35_attn_part.comp -- decode attention, split-K ("flash decoding") pass 1.
+// One workgroup per (kv head, chunk of CH keys).  All q heads of the GQA group (G = n_heads/n_kv, <= 8) are handled together so each K/V row is read once.
+// Writes, per (q head, chunk): acc[hd] = sum_k exp(s_k - m) * V_k, then m (chunk max) and l (sum of exp) at [hd], [hd+1].
+// K/V cache: f16 packed in uint, layout [kv_head][cap][hd].  Q: f32 [n_heads][hd].  hd % 64 == 0, hd <= 256.
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n_heads, n_kv, hd, n_ctx, cap, nchunks, p0, p1; float scale; };
+layout(set = 0, binding = 0) readonly  buffer QB { float q[];  };
+layout(set = 0, binding = 1) readonly  buffer KB { uvec4 k4[]; };
+layout(set = 0, binding = 2) readonly  buffer VB { uint  v2[]; };
+layout(set = 0, binding = 3) writeonly buffer PB { float part[]; };
+
+const uint CH = 128u;
+shared float qs[3584];                         // q heads (G*hd <= 2048), later the key-group pool: (KG-1)*G*hd <= 3584 for any hd in {64..256}, G <= 8
+shared float sc[8 * CH];
+shared float red[8 * 256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kvh = gl_WorkGroupID.x;
+    const uint c   = gl_WorkGroupID.y;
+    const uint G   = n_heads / n_kv;
+    const uint P   = hd >> 1u;                         // dim pairs
+    const uint nvec = hd >> 6u;                        // uvec4 (8 halves) loads per lane: hd/64
+    const uint k0 = c * CH;
+    const uint nk = min(CH, n_ctx - k0);
+
+    for (uint i = tid; i < G * hd; i += 256u) qs[i] = q[kvh * G * hd + i];
+    barrier();
+
+    const uint lane = tid & 7u;
+    for (uint it = 0u; it < CH / 32u; ++it) {
+        const uint kl = it * 32u + (tid >> 3u);
+        const bool valid = kl < nk;
+        float acc[8];
+        for (uint g = 0u; g < 8u; ++g) acc[g] = 0.0;
+        if (valid) {
+            const uint row4 = ((kvh * cap + k0 + kl) * P) >> 2u;      // uvec4 index of the row start (P % 4 == 0)
+            for (uint j = 0u; j < nvec; ++j) {
+                const uint vi = j * 8u + lane;
+                const uvec4 w = k4[row4 + vi];
+                const vec2 a = unpackHalf2x16(w.x), b = unpackHalf2x16(w.y), cc = unpackHalf2x16(w.z), d = unpackHalf2x16(w.w);
+                for (uint g = 0u; g < G; ++g) {
+                    const uint o = g * hd + vi * 8u;
+                    acc[g] += a.x * qs[o] + a.y * qs[o + 1u] + b.x * qs[o + 2u] + b.y * qs[o + 3u]
+                            + cc.x * qs[o + 4u] + cc.y * qs[o + 5u] + d.x * qs[o + 6u] + d.y * qs[o + 7u];
+                }
+            }
+        }
+        for (uint g = 0u; g < G; ++g) red[g * 256u + tid] = acc[g];
+        barrier();
+        if (lane == 0u) {
+            for (uint g = 0u; g < G; ++g) {
+                float s = 0.0;
+                for (uint l = 0u; l < 8u; ++l) s += red[g * 256u + tid + l];
+                sc[g * CH + kl] = valid ? s * scale : -3.0e38;
+            }
+        }
+        barrier();
+    }
+
+    // chunk max / exp / sum, one thread per head (CH is small)
+    if (tid < G) {
+        float m = -3.0e38;
+        for (uint k = 0u; k < nk; ++k) m = max(m, sc[tid * CH + k]);
+        float l = 0.0;
+        for (uint k = 0u; k < nk; ++k) { const float p = exp(sc[tid * CH + k] - m); sc[tid * CH + k] = p; l += p; }
+        red[tid * 2u] = m; red[tid * 2u + 1u] = l;
+    }
+    barrier();
+
+    // P*V: thread = (dim pair pr, key group kg)
+    const uint KG = 256u / P;
+    const uint pr = tid % P;
+    const uint kg = tid / P;
+    vec2 pa[8];
+    for (uint g = 0u; g < 8u; ++g) pa[g] = vec2(0.0);
+    for (uint k = kg; k < nk; k += KG) {
+        const vec2 v = unpackHalf2x16(v2[(kvh * cap + k0 + k) * P + pr]);
+        for (uint g = 0u; g < G; ++g) pa[g] += sc[g * CH + k] * v;
+    }
+    barrier();                                   // all reads of qs (scores phase) are long done; reuse qs to combine key groups
+    // layout in qs: [kg-1][g][hd];  (KG-1)*G*hd <= 3584 is enforced by the host.
+    if (kg > 0u) {
+        for (uint g = 0u; g < G; ++g) {
+            const uint o = ((kg - 1u) * G + g) * hd + pr * 2u;
+            qs[o] = pa[g].x; qs[o + 1u] = pa[g].y;
+        }
+    }
+    barrier();
+    if (kg == 0u) {
+        for (uint g = 0u; g < G; ++g) {
+            vec2 s = pa[g];
+            for (uint j = 1u; j < KG; ++j) {
+                const uint o = ((j - 1u) * G + g) * hd + pr * 2u;
+                s += vec2(qs[o], qs[o + 1u]);
+            }
+            const uint h = kvh * G + g;
+            const uint base = (h * nchunks + c) * (hd + 2u);
+            part[base + pr * 2u] = s.x; part[base + pr * 2u + 1u] = s.y;
+        }
+    }
+    if (tid < G) {
+        const uint h = kvh * G + tid;
+        const uint base = (h * nchunks + c) * (hd + 2u);
+        part[base + hd] = red[tid * 2u]; part[base + hd + 1u] = red[tid * 2u + 1u];
+    }
+}

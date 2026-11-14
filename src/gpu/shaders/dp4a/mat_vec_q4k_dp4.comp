@@ -1,0 +1,94 @@
+// nexus/src/gpu/shaders/mat_vec_q4k_dp4.comp -- GGUF Q4K, token generation with int8 dot products (dp4a)
+//
+// Same thread/row layout as mat_vec_q4k.comp, but the activation vector is pre-quantised to int8 (quant_act_q8n, scale per 32) and the
+// weight x activation products are summed with 4-way int8 dot products on the packed weight bytes -- no per-weight int->float conversion.
+// Requires VK_KHR_shader_integer_dot_product.  Push constants / dispatch as mat_vec_q4k.comp (ceil(out_rows/ROWS) groups).
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// dp4() is rewritten into OpSDotAccSat (SPV_KHR_integer_dot_product) by tools/patch_dp4a.py after glslang runs
+int dp4(uint a, uint b, int c) { return c + int(a ^ b); }   // placeholder body
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer ActBuf     { uint  xq[];   };   // int8 x4, natural order (quant_act_q8n)
+layout(set = 0, binding = 2) readonly buffer ScaleBuf   { float xs[];   };   // scale per 32 activations
+layout(set = 0, binding = 3) writeonly buffer OutputBuf { float y[];    };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    float pad;
+} pc;
+
+#ifndef ROWS
+#define ROWS 4
+#endif
+
+shared float red[ROWS * 128];
+
+float f16_to_f32(uint h){ return unpackHalf2x16(h & 0xFFFFu).x; }
+const uint ONES = 0x01010101u;
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * uint(ROWS);
+    const uint nb   = pc.n_blocks_per_row;
+    const uint sb   = tid >> 4u;
+    const uint part = tid & 15u;
+    const uint j    = part >> 2u;
+    const uint q    = part & 3u;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) acc[r] = 0.0;
+
+    for (uint pb = 0u; pb < nb; pb += 8u) {
+        const uint b = pb + sb;
+        if (b < nb) {
+            const uint i0 = 2u * j, i1 = 2u * j + 1u;
+            const uint xw = (b * 8u + i0) * 8u + q * 2u;            // activation words: block 2j, elements 8q..8q+7
+            const uint xl0 = xq[xw], xl1 = xq[xw + 1u], xh0 = xq[xw + 8u], xh1 = xq[xw + 9u];
+            const float xs0 = xs[b * 8u + i0], xs1 = xs[b * 8u + i1];
+            const int sl = dp4(ONES, xl1, dp4(ONES, xl0, 0));
+            const int sh = dp4(ONES, xh1, dp4(ONES, xh0, 0));
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) {
+                const uint row = row0 + r;
+                if (row < pc.out_rows) {
+                    const uint bw = (row * nb + b) * 36;
+                    const uint w0 = W[bw];
+                    const float d = f16_to_f32(w0), dm = f16_to_f32(w0 >> 16u);
+                    const uint s0 = W[bw + 1u], s1 = W[bw + 2u], s2 = W[bw + 3u];
+                    float sc0, mn0, sc1, mn1;
+                    if (j < 2u) {
+                        sc0 = float((s0 >> (8u * i0)) & 63u);        sc1 = float((s0 >> (8u * i1)) & 63u);
+                        mn0 = float((s1 >> (8u * i0)) & 63u);        mn1 = float((s1 >> (8u * i1)) & 63u);
+                    } else {
+                        const uint a = i0 - 4u, c = i1 - 4u;
+                        sc0 = float(((s2 >> (8u * a)) & 15u) | (((s0 >> (8u * a)) >> 6u) << 4u) & 0x30u);
+                        sc1 = float(((s2 >> (8u * c)) & 15u) | (((s0 >> (8u * c)) >> 6u) << 4u) & 0x30u);
+                        mn0 = float(((s2 >> (8u * a + 4u)) & 15u) | (((s1 >> (8u * a)) >> 6u) << 4u) & 0x30u);
+                        mn1 = float(((s2 >> (8u * c + 4u)) & 15u) | (((s1 >> (8u * c)) >> 6u) << 4u) & 0x30u);
+                    }
+                    uint a0 = W[bw + 4 + j * 8u + q * 2u], a1 = W[bw + 5 + j * 8u + q * 2u];
+                    uint l0 = a0 & 0x0F0F0F0Fu, l1 = a1 & 0x0F0F0F0Fu, h0 = (a0 >> 4u) & 0x0F0F0F0Fu, h1 = (a1 >> 4u) & 0x0F0F0F0Fu;
+                    const int dl = dp4(l1, xl1, dp4(l0, xl0, 0));
+                    const int dh = dp4(h1, xh1, dp4(h0, xh0, 0));
+                    acc[r] += d * (sc0 * xs0 * float(dl) + sc1 * xs1 * float(dh)) - dm * (mn0 * xs0 * float(sl) + mn1 * xs1 * float(sh));
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] = acc[r];
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] += red[r * 128u + tid + s];
+        }
+        barrier();
+    }
+    if (tid < uint(ROWS)) {
+        const uint row = row0 + tid;
+        if (row < pc.out_rows) y[row] = red[tid * 128u];
+    }
+}

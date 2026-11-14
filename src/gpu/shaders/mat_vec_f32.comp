@@ -1,0 +1,40 @@
+// nexus/src/gpu/shaders/mat_vec_f32.comp
+// F32 matrix-vector multiply: y[row] = dot(W[row,:], x)
+// Workgroup: 64 threads, each thread handles one output row
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { float W[]; };
+layout(set = 0, binding = 1) readonly buffer InputBuf  { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    float pad;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.out_rows) return;
+
+    float acc = 0.0;
+    uint base = row * pc.in_cols;
+
+    // Process 4 elements at a time for better throughput
+    uint i = 0;
+    for (; i + 4 <= pc.in_cols; i += 4) {
+        acc += W[base + i]     * x[i];
+        acc += W[base + i + 1] * x[i + 1];
+        acc += W[base + i + 2] * x[i + 2];
+        acc += W[base + i + 3] * x[i + 3];
+    }
+    for (; i < pc.in_cols; ++i) {
+        acc += W[base + i] * x[i];
+    }
+
+    y[row] = acc;
+}

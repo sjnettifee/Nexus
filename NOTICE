@@ -7,3 +7,9 @@ v3.0 (AGPLv3). See the LICENSE file for the full license text.
 Nexus was designed and built by Shea Nettifee over the course of a
 year, with AI assistance (Claude, and earlier development help from
 ChatGPT) used as a development tool throughout.
+
+This distribution includes third-party software under their own
+permissive licenses: Dear ImGui and stb (MIT), the Roboto font
+(Apache-2.0), and, in web/vendor/, PDF.js, Tesseract.js and its English
+language data, SheetJS (Apache-2.0), mammoth (BSD-2-Clause) and JSZip
+(MIT). See THIRD_PARTY_LICENSES.md and web/vendor/LICENSES/.

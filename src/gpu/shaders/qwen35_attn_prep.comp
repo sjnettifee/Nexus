@@ -1,0 +1,101 @@
+// qwen35_attn_prep.comp -- Qwen3.5 full-attention layer, ONE token: Q/K head norm, partial RoPE, KV-cache store.
+// Input: qg = wq output, per-head packed [q(hd) | gate(hd)] x n_heads;  kraw/vraw = wk/wv outputs.
+// Output: q_out [n_heads*hd] (normed + roped), gate_out [n_heads*hd] (raw gate), K/V written into the device cache (f16, [kv_head][cap][hd]) at `pos`,
+//         kv_out [2*kv_dim] f32 (K then V as stored, so the host cache can be kept identical).
+// One workgroup per head: groups [0,n_heads) = Q heads, [n_heads, n_heads+n_kv) = K heads, then V heads.  hd <= 512, rot even, rot <= hd.
+// Rope is NeoX rotate_half over the first `rot` dims: pairs (i, i+rot/2).  cos/sin come from the host (exact same math as the CPU path): tab[i]=cos, tab[rot/2+i]=sin.
+// Also used for ordinary attention layers (Llama, Mistral, Qwen2/2.5/3 ...).  flags (all 0 = the Qwen3.5 gated layer, unchanged):
+//   1 = q norm is (1+w)   2 = k norm is (1+w)   4 = NO output gate: qg holds plain q [n_heads*hd], gate_out untouched
+//   8 = no q head norm   16 = no k head norm    32 = interleaved RoPE: pairs (2i, 2i+1) instead of rotate_half
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n_heads, n_kv, hd, rot, pos, cap, flags, pad0; float eps; };
+layout(set = 0, binding = 0)  readonly  buffer QG    { float qg[];    };
+layout(set = 0, binding = 1)  readonly  buffer KR    { float kraw[];  };
+layout(set = 0, binding = 2)  readonly  buffer VR    { float vraw[];  };
+layout(set = 0, binding = 3)  readonly  buffer QN    { float qnw[];   };
+layout(set = 0, binding = 4)  readonly  buffer KN    { float knw[];   };
+layout(set = 0, binding = 5)  readonly  buffer TAB   { float tab[];   };
+layout(set = 0, binding = 6)  writeonly buffer QO    { float q_out[]; };
+layout(set = 0, binding = 7)  writeonly buffer GO    { float gate_out[]; };
+layout(set = 0, binding = 8)  writeonly buffer KC    { uint  kc[];    };
+layout(set = 0, binding = 9)  writeonly buffer VC    { uint  vc[];    };
+layout(set = 0, binding = 10) writeonly buffer KVO   { float kv_out[]; };
+
+shared float sa[512];
+shared float sb[512];
+shared float red[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint g = gl_WorkGroupID.x;
+    const bool isq = g < n_heads;
+    const bool isk = !isq && g < n_heads + n_kv;
+    const uint head = isq ? g : (isk ? g - n_heads : g - n_heads - n_kv);
+    const uint kv_dim = n_kv * hd;
+
+    const bool gated = (flags & 4u) == 0u;
+    const bool do_norm = isq ? ((flags & 8u) == 0u) : ((flags & 16u) == 0u);
+    const bool interleaved = (flags & 32u) != 0u;
+    // load
+    for (uint d = tid; d < hd; d += 256u) {
+        float v;
+        if (isq)      v = gated ? qg[head * 2u * hd + d] : qg[head * hd + d];
+        else if (isk) v = kraw[head * hd + d];
+        else          v = vraw[head * hd + d];
+        sa[d] = v;
+        if (isq && gated) gate_out[head * hd + d] = qg[head * 2u * hd + hd + d];
+    }
+    barrier();
+
+    if (!(isq || isk)) {                       // V: no norm, no rope
+        for (uint d = tid; d < hd; d += 256u) sb[d] = sa[d];
+    } else {
+      if (do_norm) {                           // uniform per workgroup: barriers inside are safe
+        float ss = 0.0;
+        for (uint d = tid; d < hd; d += 256u) ss += sa[d] * sa[d];
+        red[tid] = ss;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        const float inv = inversesqrt(red[0] / float(hd) + eps);
+        const bool zc = isq ? ((flags & 1u) != 0u) : ((flags & 2u) != 0u);
+        for (uint d = tid; d < hd; d += 256u) {
+            float w = isq ? qnw[d] : knw[d];
+            if (zc) w += 1.0;
+            sa[d] = sa[d] * inv * w;
+        }
+        barrier();
+      }
+        const uint half_r = rot >> 1u;
+        for (uint d = tid; d < hd; d += 256u) {
+            float o = sa[d];
+            if (interleaved) {
+                if (d < rot) {
+                    const uint i = d >> 1u;
+                    if ((d & 1u) == 0u) o = sa[d] * tab[i] - sa[d + 1u] * tab[half_r + i];
+                    else                o = sa[d - 1u] * tab[half_r + i] + sa[d] * tab[i];
+                }
+            } else {
+                if (d < half_r)      o = sa[d] * tab[d] - sa[d + half_r] * tab[half_r + d];
+                else if (d < rot)    { const uint i = d - half_r; o = sa[d] * tab[i] + sa[i] * tab[half_r + i]; }
+            }
+            sb[d] = o;
+        }
+    }
+    barrier();
+
+    if (isq) {
+        for (uint d = tid; d < hd; d += 256u) q_out[head * hd + d] = sb[d];
+    } else {
+        const uint base = (head * cap + pos) * (hd >> 1u);
+        for (uint p = tid; p < (hd >> 1u); p += 256u) {
+            const float a = sb[2u * p], b = sb[2u * p + 1u];
+            const uint pk = packHalf2x16(vec2(a, b));
+            if (isk) kc[base + p] = pk; else vc[base + p] = pk;
+        }
+        for (uint d = tid; d < hd; d += 256u) kv_out[(isk ? 0u : kv_dim) + head * hd + d] = sb[d];
+    }
+}

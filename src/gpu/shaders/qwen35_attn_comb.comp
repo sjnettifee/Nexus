@@ -1,0 +1,41 @@
+// qwen35_attn_comb.comp -- decode attention pass 2: merge the per-chunk partials of one q head and apply the output gate sigmoid(gate).
+// out[h*hd+d] = (sum_c acc_c[d] * exp(m_c - M)) / (sum_c l_c * exp(m_c - M)) * sigmoid(gate[h*hd+d])      (sigmoid clamped like the CPU path)
+// p0 = 1: ordinary attention layer (no output gate) -- the gate buffer is not read.
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint hd, nchunks, p0, p1; };
+layout(set = 0, binding = 0) readonly  buffer PB { float part[]; };
+layout(set = 0, binding = 1) readonly  buffer GB { float gate[]; };
+layout(set = 0, binding = 2) writeonly buffer OB { float outv[]; };
+shared float wgt[1024];                    // exp(m_c - M) per chunk (nchunks <= 1024), then reused
+shared float red[256];
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.x;
+    const uint stride = hd + 2u;
+    float mx = -3.0e38;
+    for (uint c = tid; c < nchunks; c += 256u) mx = max(mx, part[(h * nchunks + c) * stride + hd]);
+    red[tid] = mx; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); barrier(); }
+    const float M = red[0];
+    barrier();
+    float l = 0.0;
+    for (uint c = tid; c < nchunks; c += 256u) {
+        const float w = exp(part[(h * nchunks + c) * stride + hd] - M);
+        wgt[c] = w; l += w * part[(h * nchunks + c) * stride + hd + 1u];
+    }
+    red[tid] = l; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    const float L = red[0];
+    barrier();
+    for (uint d = tid; d < hd; d += 256u) {
+        float a = 0.0;
+        for (uint c = 0u; c < nchunks; ++c) a += part[(h * nchunks + c) * stride + d] * wgt[c];
+        float sg = 1.0;
+        if (p0 == 0u) {
+            const float z = gate[h * hd + d];
+            if (z > 80.0) sg = 1.0; else if (z < -80.0) sg = 0.0; else sg = 1.0 / (1.0 + exp(-z));
+        }
+        outv[h * hd + d] = a / L * sg;
+    }
+}

@@ -1,0 +1,72 @@
+// nexus/src/gpu/shaders/mat_vec_f16.comp — plain f16 weights, token generation (matrix x vector), v3 design (see mat_vec_q4k.comp)
+// 128 threads, 16 rows per workgroup; each thread owns 8 consecutive columns (4 words) of a 1024-column pass.  in_cols must be even.
+// DISPATCH: ceil(out_rows / ROWS) workgroups.  Push constants: out_rows, in_cols, pad0, pad1
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer InputBuf  { float x_in[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];   };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint pad0;
+    float pad1;
+} pc;
+
+#ifndef ROWS
+#define ROWS 16
+#endif
+
+shared float red[ROWS * 128];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * uint(ROWS);
+    const uint nw   = pc.in_cols >> 1u;          // words per row
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) acc[r] = 0.0;
+
+    for (uint pb = 0u; pb < nw; pb += 512u) {
+        const uint w0 = pb + tid * 4u;           // first word of this thread's slice
+        if (w0 < nw) {
+            float xr[8];
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                const bool ok = (w0 + k) < nw;
+                xr[2u * k]      = ok ? x_in[2u * (w0 + k)]      : 0.0;
+                xr[2u * k + 1u] = ok ? x_in[2u * (w0 + k) + 1u] : 0.0;
+            }
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) {
+                const uint row = row0 + r;
+                if (row < pc.out_rows) {
+                    const uint base = row * nw + w0;
+                    float s = 0.0;
+                    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                        if (w0 + k < nw) {
+                            const vec2 v = unpackHalf2x16(W[base + k]);
+                            s += v.x * xr[2u * k] + v.y * xr[2u * k + 1u];
+                        }
+                    }
+                    acc[r] += s;
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] = acc[r];
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] += red[r * 128u + tid + s];
+        }
+        barrier();
+    }
+    if (tid < uint(ROWS)) {
+        const uint row = row0 + tid;
+        if (row < pc.out_rows) y[row] = red[tid * 128u];
+    }
+}

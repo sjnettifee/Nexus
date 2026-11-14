@@ -1,0 +1,254 @@
+// nexus/src/gpu/shaders/qwen35_scan_reg.comp  (v3: state split over 4 threads per column)
+// Qwen3Next / GatedDeltaNet recurrent scan for full-prompt prefill, head_dim == 128 only.
+//
+// Measured on a GTX 1060 (selftest --bench): the original kernel needs 128 us per token because its 128x128 state per head lives in global memory and is
+// swept several times per token (~15 MB of DRAM traffic per token over all heads).  A first register version with ONE thread per state column (128 state
+// values per thread) was SLOWER (226 us/token): at that register count the driver spills the state to local memory, which is global memory again.
+//
+// This version keeps the state in registers without spilling: a workgroup of 512 threads owns one value head; thread (part, j) holds 32 of the 128
+// state values of column j (rows part*32 .. part*32+31).  The 4 partial dot products per column are combined through shared memory (4 barriers per token).
+// Loops over the 32 state rows are written out by hand so every S[i] is a register.
+// Same bindings and push constants as qwen35_scan.comp.  Dispatch: (vh, 1, 1).  Summation order differs slightly (partial sums), results agree to ~1e-6.
+
+#version 450
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer ConvBuf  { float conv[];  };
+layout(set = 0, binding = 1) readonly  buffer ABuf     { float avec[];  };
+layout(set = 0, binding = 2) readonly  buffer BBuf     { float bvec[];  };
+layout(set = 0, binding = 3) readonly  buffer ZBuf     { float zvec[];  };
+layout(set = 0, binding = 4) readonly  buffer ALogBuf  { float A_log[]; };
+layout(set = 0, binding = 5) readonly  buffer DtBuf    { float dt[];    };
+layout(set = 0, binding = 6) readonly  buffer NormBuf  { float normw[]; };
+layout(set = 0, binding = 7) buffer StateBuf           { float state[]; };
+layout(set = 0, binding = 8) writeonly buffer CoreBuf  { float core[];  };
+
+layout(push_constant) uniform PC {
+    uint n_tokens;
+    uint conv_dim;
+    uint key_dim;
+    uint value_dim;
+    uint kh;
+    uint vh;
+    uint hd;
+    uint repeat;
+    uint grouped;
+    float eps;
+} pc;
+
+const uint HD = 128u;
+
+shared float sh_q[HD];
+shared float sh_k[HD];
+shared float sh_p[4 * HD];     // per-part partial kv_mem
+shared float sh_r[4 * HD];     // per-part partial raw
+shared float sh_raw[HD];
+
+float sigmoid_safe(float x) {
+    if (x > 80.0) return 1.0;
+    if (x < -80.0) return 0.0;
+    return 1.0 / (1.0 + exp(-x));
+}
+float softplus_safe(float x) {
+    if (x > 40.0) return x;
+    if (x < -40.0) return exp(x);
+    return log(1.0 + exp(x));
+}
+float silu_safe(float x) { return x * sigmoid_safe(x); }
+
+void main() {
+    const uint hv   = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint part = tid >> 7u;          // 0..3  : state rows part*32 .. part*32+31
+    const uint j    = tid & 127u;         // state column
+    if (hv >= pc.vh || pc.hd != HD || pc.repeat == 0u) return;
+
+    const uint hk = hv / pc.repeat;
+    const uint rr = hv - hk * pc.repeat;
+    const uint state_base = hv * HD * HD + part * 32u * HD;
+    const uint row0 = part * 32u;
+
+    float S[32];
+    S[0] = state[state_base + 0u * HD + j];
+    S[1] = state[state_base + 1u * HD + j];
+    S[2] = state[state_base + 2u * HD + j];
+    S[3] = state[state_base + 3u * HD + j];
+    S[4] = state[state_base + 4u * HD + j];
+    S[5] = state[state_base + 5u * HD + j];
+    S[6] = state[state_base + 6u * HD + j];
+    S[7] = state[state_base + 7u * HD + j];
+    S[8] = state[state_base + 8u * HD + j];
+    S[9] = state[state_base + 9u * HD + j];
+    S[10] = state[state_base + 10u * HD + j];
+    S[11] = state[state_base + 11u * HD + j];
+    S[12] = state[state_base + 12u * HD + j];
+    S[13] = state[state_base + 13u * HD + j];
+    S[14] = state[state_base + 14u * HD + j];
+    S[15] = state[state_base + 15u * HD + j];
+    S[16] = state[state_base + 16u * HD + j];
+    S[17] = state[state_base + 17u * HD + j];
+    S[18] = state[state_base + 18u * HD + j];
+    S[19] = state[state_base + 19u * HD + j];
+    S[20] = state[state_base + 20u * HD + j];
+    S[21] = state[state_base + 21u * HD + j];
+    S[22] = state[state_base + 22u * HD + j];
+    S[23] = state[state_base + 23u * HD + j];
+    S[24] = state[state_base + 24u * HD + j];
+    S[25] = state[state_base + 25u * HD + j];
+    S[26] = state[state_base + 26u * HD + j];
+    S[27] = state[state_base + 27u * HD + j];
+    S[28] = state[state_base + 28u * HD + j];
+    S[29] = state[state_base + 29u * HD + j];
+    S[30] = state[state_base + 30u * HD + j];
+    S[31] = state[state_base + 31u * HD + j];
+
+    const float scale = inversesqrt(float(HD));
+    const float nw = normw[j];
+
+    for (uint t = 0u; t < pc.n_tokens; ++t) {
+        uint qoff, koff, voff;
+        if (pc.grouped != 0u) {
+            const uint group_span = 2u * HD + pc.repeat * HD;
+            const uint base = t * pc.conv_dim + hk * group_span;
+            qoff = base; koff = base + HD; voff = base + 2u * HD + rr * HD;
+        } else {
+            const uint base = t * pc.conv_dim;
+            qoff = base + hk * HD;
+            koff = base + pc.key_dim + hk * HD;
+            voff = base + 2u * pc.key_dim + hv * HD;
+        }
+
+        if (tid < HD) { sh_q[tid] = conv[qoff + tid]; sh_k[tid] = conv[koff + tid]; }
+        const float vj = conv[voff + j];
+        const float zg = zvec[t * pc.value_dim + hv * HD + j];
+        const float beta = sigmoid_safe(bvec[t * pc.vh + hv]);
+        float g = A_log[hv] * softplus_safe(avec[t * pc.vh + hv] + dt[hv]);
+        if (isnan(g) || isinf(g)) g = -60.0;
+        if (g > 0.0) g = 0.0;
+        if (g < -60.0) g = -60.0;
+        const float decay = exp(g);
+        barrier();
+
+        float qss = 0.0, kss = 0.0;
+        for (uint i = 0u; i < HD; ++i) { const float a = sh_q[i]; const float b = sh_k[i]; qss += a * a; kss += b * b; }
+        const float qinv = inversesqrt(qss + 1.0e-6);
+        const float kinv = inversesqrt(kss + 1.0e-6);
+
+        float kvp = 0.0;
+        S[0] *= decay; kvp += (sh_k[row0 + 0u] * kinv) * S[0];
+        S[1] *= decay; kvp += (sh_k[row0 + 1u] * kinv) * S[1];
+        S[2] *= decay; kvp += (sh_k[row0 + 2u] * kinv) * S[2];
+        S[3] *= decay; kvp += (sh_k[row0 + 3u] * kinv) * S[3];
+        S[4] *= decay; kvp += (sh_k[row0 + 4u] * kinv) * S[4];
+        S[5] *= decay; kvp += (sh_k[row0 + 5u] * kinv) * S[5];
+        S[6] *= decay; kvp += (sh_k[row0 + 6u] * kinv) * S[6];
+        S[7] *= decay; kvp += (sh_k[row0 + 7u] * kinv) * S[7];
+        S[8] *= decay; kvp += (sh_k[row0 + 8u] * kinv) * S[8];
+        S[9] *= decay; kvp += (sh_k[row0 + 9u] * kinv) * S[9];
+        S[10] *= decay; kvp += (sh_k[row0 + 10u] * kinv) * S[10];
+        S[11] *= decay; kvp += (sh_k[row0 + 11u] * kinv) * S[11];
+        S[12] *= decay; kvp += (sh_k[row0 + 12u] * kinv) * S[12];
+        S[13] *= decay; kvp += (sh_k[row0 + 13u] * kinv) * S[13];
+        S[14] *= decay; kvp += (sh_k[row0 + 14u] * kinv) * S[14];
+        S[15] *= decay; kvp += (sh_k[row0 + 15u] * kinv) * S[15];
+        S[16] *= decay; kvp += (sh_k[row0 + 16u] * kinv) * S[16];
+        S[17] *= decay; kvp += (sh_k[row0 + 17u] * kinv) * S[17];
+        S[18] *= decay; kvp += (sh_k[row0 + 18u] * kinv) * S[18];
+        S[19] *= decay; kvp += (sh_k[row0 + 19u] * kinv) * S[19];
+        S[20] *= decay; kvp += (sh_k[row0 + 20u] * kinv) * S[20];
+        S[21] *= decay; kvp += (sh_k[row0 + 21u] * kinv) * S[21];
+        S[22] *= decay; kvp += (sh_k[row0 + 22u] * kinv) * S[22];
+        S[23] *= decay; kvp += (sh_k[row0 + 23u] * kinv) * S[23];
+        S[24] *= decay; kvp += (sh_k[row0 + 24u] * kinv) * S[24];
+        S[25] *= decay; kvp += (sh_k[row0 + 25u] * kinv) * S[25];
+        S[26] *= decay; kvp += (sh_k[row0 + 26u] * kinv) * S[26];
+        S[27] *= decay; kvp += (sh_k[row0 + 27u] * kinv) * S[27];
+        S[28] *= decay; kvp += (sh_k[row0 + 28u] * kinv) * S[28];
+        S[29] *= decay; kvp += (sh_k[row0 + 29u] * kinv) * S[29];
+        S[30] *= decay; kvp += (sh_k[row0 + 30u] * kinv) * S[30];
+        S[31] *= decay; kvp += (sh_k[row0 + 31u] * kinv) * S[31];
+        sh_p[part * HD + j] = kvp;
+        barrier();
+
+        const float kv_mem = (sh_p[j] + sh_p[HD + j]) + (sh_p[2u * HD + j] + sh_p[3u * HD + j]);
+        const float delta = (vj - kv_mem) * beta;
+
+        float rawp = 0.0;
+        S[0] += (sh_k[row0 + 0u] * kinv) * delta; rawp += (sh_q[row0 + 0u] * qinv * scale) * S[0];
+        S[1] += (sh_k[row0 + 1u] * kinv) * delta; rawp += (sh_q[row0 + 1u] * qinv * scale) * S[1];
+        S[2] += (sh_k[row0 + 2u] * kinv) * delta; rawp += (sh_q[row0 + 2u] * qinv * scale) * S[2];
+        S[3] += (sh_k[row0 + 3u] * kinv) * delta; rawp += (sh_q[row0 + 3u] * qinv * scale) * S[3];
+        S[4] += (sh_k[row0 + 4u] * kinv) * delta; rawp += (sh_q[row0 + 4u] * qinv * scale) * S[4];
+        S[5] += (sh_k[row0 + 5u] * kinv) * delta; rawp += (sh_q[row0 + 5u] * qinv * scale) * S[5];
+        S[6] += (sh_k[row0 + 6u] * kinv) * delta; rawp += (sh_q[row0 + 6u] * qinv * scale) * S[6];
+        S[7] += (sh_k[row0 + 7u] * kinv) * delta; rawp += (sh_q[row0 + 7u] * qinv * scale) * S[7];
+        S[8] += (sh_k[row0 + 8u] * kinv) * delta; rawp += (sh_q[row0 + 8u] * qinv * scale) * S[8];
+        S[9] += (sh_k[row0 + 9u] * kinv) * delta; rawp += (sh_q[row0 + 9u] * qinv * scale) * S[9];
+        S[10] += (sh_k[row0 + 10u] * kinv) * delta; rawp += (sh_q[row0 + 10u] * qinv * scale) * S[10];
+        S[11] += (sh_k[row0 + 11u] * kinv) * delta; rawp += (sh_q[row0 + 11u] * qinv * scale) * S[11];
+        S[12] += (sh_k[row0 + 12u] * kinv) * delta; rawp += (sh_q[row0 + 12u] * qinv * scale) * S[12];
+        S[13] += (sh_k[row0 + 13u] * kinv) * delta; rawp += (sh_q[row0 + 13u] * qinv * scale) * S[13];
+        S[14] += (sh_k[row0 + 14u] * kinv) * delta; rawp += (sh_q[row0 + 14u] * qinv * scale) * S[14];
+        S[15] += (sh_k[row0 + 15u] * kinv) * delta; rawp += (sh_q[row0 + 15u] * qinv * scale) * S[15];
+        S[16] += (sh_k[row0 + 16u] * kinv) * delta; rawp += (sh_q[row0 + 16u] * qinv * scale) * S[16];
+        S[17] += (sh_k[row0 + 17u] * kinv) * delta; rawp += (sh_q[row0 + 17u] * qinv * scale) * S[17];
+        S[18] += (sh_k[row0 + 18u] * kinv) * delta; rawp += (sh_q[row0 + 18u] * qinv * scale) * S[18];
+        S[19] += (sh_k[row0 + 19u] * kinv) * delta; rawp += (sh_q[row0 + 19u] * qinv * scale) * S[19];
+        S[20] += (sh_k[row0 + 20u] * kinv) * delta; rawp += (sh_q[row0 + 20u] * qinv * scale) * S[20];
+        S[21] += (sh_k[row0 + 21u] * kinv) * delta; rawp += (sh_q[row0 + 21u] * qinv * scale) * S[21];
+        S[22] += (sh_k[row0 + 22u] * kinv) * delta; rawp += (sh_q[row0 + 22u] * qinv * scale) * S[22];
+        S[23] += (sh_k[row0 + 23u] * kinv) * delta; rawp += (sh_q[row0 + 23u] * qinv * scale) * S[23];
+        S[24] += (sh_k[row0 + 24u] * kinv) * delta; rawp += (sh_q[row0 + 24u] * qinv * scale) * S[24];
+        S[25] += (sh_k[row0 + 25u] * kinv) * delta; rawp += (sh_q[row0 + 25u] * qinv * scale) * S[25];
+        S[26] += (sh_k[row0 + 26u] * kinv) * delta; rawp += (sh_q[row0 + 26u] * qinv * scale) * S[26];
+        S[27] += (sh_k[row0 + 27u] * kinv) * delta; rawp += (sh_q[row0 + 27u] * qinv * scale) * S[27];
+        S[28] += (sh_k[row0 + 28u] * kinv) * delta; rawp += (sh_q[row0 + 28u] * qinv * scale) * S[28];
+        S[29] += (sh_k[row0 + 29u] * kinv) * delta; rawp += (sh_q[row0 + 29u] * qinv * scale) * S[29];
+        S[30] += (sh_k[row0 + 30u] * kinv) * delta; rawp += (sh_q[row0 + 30u] * qinv * scale) * S[30];
+        S[31] += (sh_k[row0 + 31u] * kinv) * delta; rawp += (sh_q[row0 + 31u] * qinv * scale) * S[31];
+        sh_r[part * HD + j] = rawp;
+        barrier();
+
+        const float raw = (sh_r[j] + sh_r[HD + j]) + (sh_r[2u * HD + j] + sh_r[3u * HD + j]);
+        if (tid < HD) sh_raw[tid] = raw;
+        barrier();
+
+        float ss = 0.0;
+        for (uint i = 0u; i < HD; ++i) { const float r = sh_raw[i]; ss += r * r; }
+        const float rinv = inversesqrt(ss / float(HD) + pc.eps);
+        if (tid < HD) core[t * pc.value_dim + hv * HD + j] = raw * rinv * nw * silu_safe(zg);
+    }
+
+    state[state_base + 0u * HD + j] = S[0];
+    state[state_base + 1u * HD + j] = S[1];
+    state[state_base + 2u * HD + j] = S[2];
+    state[state_base + 3u * HD + j] = S[3];
+    state[state_base + 4u * HD + j] = S[4];
+    state[state_base + 5u * HD + j] = S[5];
+    state[state_base + 6u * HD + j] = S[6];
+    state[state_base + 7u * HD + j] = S[7];
+    state[state_base + 8u * HD + j] = S[8];
+    state[state_base + 9u * HD + j] = S[9];
+    state[state_base + 10u * HD + j] = S[10];
+    state[state_base + 11u * HD + j] = S[11];
+    state[state_base + 12u * HD + j] = S[12];
+    state[state_base + 13u * HD + j] = S[13];
+    state[state_base + 14u * HD + j] = S[14];
+    state[state_base + 15u * HD + j] = S[15];
+    state[state_base + 16u * HD + j] = S[16];
+    state[state_base + 17u * HD + j] = S[17];
+    state[state_base + 18u * HD + j] = S[18];
+    state[state_base + 19u * HD + j] = S[19];
+    state[state_base + 20u * HD + j] = S[20];
+    state[state_base + 21u * HD + j] = S[21];
+    state[state_base + 22u * HD + j] = S[22];
+    state[state_base + 23u * HD + j] = S[23];
+    state[state_base + 24u * HD + j] = S[24];
+    state[state_base + 25u * HD + j] = S[25];
+    state[state_base + 26u * HD + j] = S[26];
+    state[state_base + 27u * HD + j] = S[27];
+    state[state_base + 28u * HD + j] = S[28];
+    state[state_base + 29u * HD + j] = S[29];
+    state[state_base + 30u * HD + j] = S[30];
+    state[state_base + 31u * HD + j] = S[31];
+}

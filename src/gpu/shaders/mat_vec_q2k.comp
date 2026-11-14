@@ -1,0 +1,84 @@
+// nexus/src/gpu/shaders/mat_vec_q2k.comp — GGUF Q2_K, token generation (matrix x vector), v3 design (see mat_vec_q4k.comp)
+//
+// Q2_K block = 256 weights = 84 bytes (21 words, 4-byte aligned): scales[16] (low nibble = scale, high nibble = min) | qs[64] (2 bits each) | d, dmin (f16).
+// Step s = 0..7 covers 32 weights: n = s/4, j = s%4;  weight c (0..31) = ((qs[32n + c] >> 2j) & 3), sub-block scale byte 2s + c/16.   w = d*(sc&15)*q - dmin*(sc>>4).
+// Thread t of a pass: superblock sb = t/16, part = t%16, s = part/2, h = part%2 -> 16 weights (c = 16h..16h+15).  Threads that share (n, h) read the same 16 bytes
+// (one memory transaction inside a warp).  16 rows per workgroup, 128 threads.
+// DISPATCH: ceil(out_rows / ROWS) workgroups.  in_cols must be a multiple of 256.  Push constants: out_rows, in_cols, n_blocks_per_row (= in_cols/256), pad
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer InputBuf   { float x_in[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];    };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;
+    float pad;
+} pc;
+
+#ifndef ROWS
+#define ROWS 16
+#endif
+
+shared float red[ROWS * 128];
+
+float f16_to_f32(uint h){ return unpackHalf2x16(h & 0xFFFFu).x; }
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * uint(ROWS);
+    const uint nb   = pc.n_blocks_per_row;
+    const uint sb   = tid >> 4u;
+    const uint part = tid & 15u;
+    const uint s    = part >> 1u;
+    const uint h    = part & 1u;
+    const uint n    = s >> 2u;
+    const uint sh   = 2u * (s & 3u);
+    const uint idx  = 2u * s + h;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) acc[r] = 0.0;
+
+    for (uint pb = 0u; pb < nb; pb += 8u) {
+        const uint b = pb + sb;
+        if (b < nb) {
+            const uint xb = b * 256u + s * 32u + h * 16u;
+            float xr[16];
+            float sx = 0.0;
+            [[unroll]] for (uint k = 0u; k < 16u; ++k) { xr[k] = x_in[xb + k]; sx += xr[k]; }
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) {
+                const uint row = row0 + r;
+                if (row < pc.out_rows) {
+                    const uint bw  = (row * nb + b) * 21u;
+                    const uint scb = (W[bw + (idx >> 2u)] >> ((idx & 3u) * 8u)) & 255u;
+                    const uint dd  = W[bw + 20u];
+                    const uint q0 = W[bw + 4u + 8u * n + 4u * h], q1 = W[bw + 5u + 8u * n + 4u * h], q2 = W[bw + 6u + 8u * n + 4u * h], q3 = W[bw + 7u + 8u * n + 4u * h];
+                    float dq = 0.0;
+                    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                        dq += float((q0 >> (8u * k + sh)) & 3u) * xr[k]      + float((q1 >> (8u * k + sh)) & 3u) * xr[4u + k]
+                            + float((q2 >> (8u * k + sh)) & 3u) * xr[8u + k] + float((q3 >> (8u * k + sh)) & 3u) * xr[12u + k];
+                    }
+                    acc[r] += f16_to_f32(dd) * float(scb & 15u) * dq - f16_to_f32(dd >> 16u) * float(scb >> 4u) * sx;
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] = acc[r];
+    barrier();
+    for (uint st = 64u; st > 0u; st >>= 1u) {
+        if (tid < st) {
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] += red[r * 128u + tid + st];
+        }
+        barrier();
+    }
+    if (tid < uint(ROWS)) {
+        const uint row = row0 + tid;
+        if (row < pc.out_rows) y[row] = red[tid * 128u];
+    }
+}

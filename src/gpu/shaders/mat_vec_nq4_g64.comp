@@ -1,0 +1,108 @@
+// nexus/src/gpu/shaders/mat_vec_nq4_g64.comp — Nexus native NQ4_G64, token generation (matrix x vector)
+//
+// Block layout (verified against nexus_native_quant_builder._quantize_rows_g64):
+//   group size = 64 weights
+//   record     = 34 bytes per group:
+//       bytes 0-1 : scale, little-endian FP16 (one scale per 64 values)
+//       bytes 2-33: 32 packed bytes; weight i is the low nibble of byte (i/2)
+//                   when i is even, high nibble when i is odd.
+//   dequant: w = (nibble - 8) * scale     (symmetric signed int4, offset 8)
+//
+// SPEED DESIGN (v3).  Measured on a GTX 1060: v1 (one thread per row, byte reads) 27 GB/s, v2 (32 threads share a row, x staged
+// in shared memory, 4 rows per workgroup) 34 GB/s -- v2 was limited by the x vector, not the weights: with 4 rows per workgroup every
+// workgroup re-read the whole x vector (4 bytes per weight) to use 0.53 bytes of weights per weight.
+//
+// v3 turns that around.  A workgroup of 128 threads produces ROWS (16) output rows.  Each thread owns a 16-column slice of x and keeps
+// it in registers, then walks down ALL the rows of the workgroup applying that slice to each row's weights -- so x is read once per
+// 16 rows and the weight stream is what the memory system sees.  Neighbouring threads read neighbouring 8-byte pieces of the same row
+// (coalesced), many independent loads are in flight (rows are independent), and the 128 partial sums of every row are added at the
+// end in shared memory.
+//
+// DISPATCH: ceil(out_rows / ROWS) workgroups (Pipeline::rows_per_group in the backend must equal ROWS).
+// Push constants identical to the other mat_vec shaders: out_rows, in_cols, n_blocks_per_row (= ceil(in_cols/64)), pad
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf  { uint  W[];    };
+layout(set = 0, binding = 1) readonly buffer InputBuf   { float x_in[]; };
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { float y[];    };
+
+layout(push_constant) uniform PC {
+    uint out_rows;
+    uint in_cols;
+    uint n_blocks_per_row;   // groups per row
+    float pad;
+} pc;
+
+#ifndef ROWS
+#define ROWS 16                // rows per workgroup (== Pipeline::rows_per_group in the backend)
+#endif
+
+shared float red[ROWS * 128];
+
+float f16_to_f32(uint h){ return unpackHalf2x16(h & 0xFFFFu).x; }   // exact IEEE half decode on every GPU
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * uint(ROWS);
+    const uint nb   = pc.n_blocks_per_row;
+    const uint last_word = (pc.out_rows * nb * 34u + 3u) / 4u - 1u;      // never read past the end of the matrix
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) acc[r] = 0.0;
+
+    // one pass = 32 groups = 2048 columns: thread t owns columns 16*t .. 16*t+15 of the pass (group t/4, quarter t%4)
+    for (uint pb = 0u; pb < nb; pb += 32u) {
+        const uint g = pb + (tid >> 2u);
+        if (g < nb) {
+            const uint q    = tid & 3u;
+            const uint col0 = g * 64u + q * 16u;
+
+            float xr[16];
+            float sx = 0.0;
+            [[unroll]] for (uint k = 0u; k < 16u; ++k) {
+                float v = 0.0;
+                if (col0 + k < pc.in_cols) v = x_in[col0 + k];
+                xr[k] = v;
+                sx += v;
+            }
+
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) {
+                const uint row = row0 + r;
+                if (row < pc.out_rows) {
+                    const uint rec = row * nb * 34u + g * 34u;           // this group's record, in bytes (even)
+                    const uint o   = rec + 2u + q * 8u;                  // this thread's 8 packed bytes
+                    const uint w0  = o >> 2u;
+                    const uint a   = W[w0];
+                    const uint b   = W[min(w0 + 1u, last_word)];
+                    const uint c   = W[min(w0 + 2u, last_word)];
+                    const bool sh  = (o & 2u) != 0u;                     // starts on a half word -> realign
+                    const uint lo  = sh ? ((a >> 16u) | (b << 16u)) : a; // weights 0..7 of this slice
+                    const uint hi  = sh ? ((b >> 16u) | (c << 16u)) : b; // weights 8..15
+                    const float scale = f16_to_f32(W[rec >> 2u] >> ((rec & 2u) * 8u));
+                    float d = 0.0;
+                    [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+                        d += float((lo >> (4u * n)) & 15u) * xr[n] + float((hi >> (4u * n)) & 15u) * xr[8u + n];
+                    }
+                    acc[r] += scale * (d - 8.0 * sx);
+                }
+            }
+        }
+    }
+
+    // add the 128 partial sums of every row
+    [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] = acc[r];
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            [[unroll]] for (uint r = 0u; r < uint(ROWS); ++r) red[r * 128u + tid] += red[r * 128u + tid + s];
+        }
+        barrier();
+    }
+    if (tid < uint(ROWS)) {
+        const uint row = row0 + tid;
+        if (row < pc.out_rows) y[row] = red[tid * 128u];
+    }
+}

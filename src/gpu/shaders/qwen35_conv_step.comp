@@ -1,0 +1,35 @@
+// nexus/src/gpu/shaders/qwen35_conv_step.comp
+// Qwen3Next / Qwen3.5 depthwise causal conv for ONE decoded token, with the rolling state updated in place.
+//   out[c] = silu( sum_{k<K-1} state[c][k] * w[c][k]  +  mixed[c] * w[c][K-1] )
+//   state[c] = [state[c][1..K-2], mixed[c]]          (each channel is owned by exactly one invocation, so the in-place shift is race free)
+// Bindings: 0 mixed[conv_dim] (in)   1 state[conv_dim*(K-1)] (in/out)   2 weight[conv_dim*K] (in)   3 out[conv_dim] (out)
+// Dispatch: ceil(conv_dim / 256) workgroups.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer MixedBuf  { float mixed[];  };
+layout(set = 0, binding = 1)           buffer StateBuf  { float state[];  };
+layout(set = 0, binding = 2) readonly  buffer WeightBuf { float weight[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf    { float outv[];   };
+
+layout(push_constant) uniform PC {
+    uint conv_dim;
+    uint kernel;
+    uint pad0;
+    uint pad1;
+} pc;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.conv_dim) return;
+    const uint hist = pc.kernel - 1u;
+    const float cur = mixed[c];
+    float sum = 0.0;
+    for (uint k = 0u; k < hist; ++k) sum += state[c * hist + k] * weight[c * pc.kernel + k];
+    sum += cur * weight[c * pc.kernel + hist];
+    outv[c] = sum / (1.0 + exp(-sum));
+    if (hist > 0u) {
+        for (uint k = 0u; k + 1u < hist; ++k) state[c * hist + k] = state[c * hist + k + 1u];
+        state[c * hist + hist - 1u] = cur;
+    }
+}

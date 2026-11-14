@@ -1,0 +1,92 @@
+#version 450
+
+// Nexus visual-tower full attention, non-causal, token-major f32.
+// Full-token, full-layer GPU attention. No image chunking and no query-block scheduler.
+//
+// One workgroup computes one (head, query_token) output vector.
+// This build-compatible version avoids subgroup ops, so glslang can emit the
+// same SPIR-V level as the rest of the Nexus shaders.
+//
+// Q/K/V layout: [n_tokens][n_heads][head_dim]
+// O layout:     [n_tokens][n_heads][head_dim]
+
+#define MAX_HD 128
+layout(local_size_x = MAX_HD, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float Q[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float K[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float V[]; };
+layout(set = 0, binding = 3) writeonly buffer OBuf { float O[]; };
+
+layout(push_constant) uniform PC {
+    uint n_heads;
+    uint head_dim;
+    uint n_tokens;
+    uint d_model;
+    float scale;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+shared float dot_part[MAX_HD];
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint qi   = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+
+    // Whole-workgroup guard; all lanes take the same branch, so barriers are legal.
+    if (h >= pc.n_heads || qi >= pc.n_tokens || pc.head_dim > MAX_HD) {
+        return;
+    }
+
+    uint q_base = qi * pc.d_model + h * pc.head_dim;
+
+    // Online softmax state. Each lane owns one output dimension when lane < head_dim.
+    float m = -3.402823466e+38;
+    float l = 0.0;
+    float acc = 0.0;
+
+    for (uint kj = 0u; kj < pc.n_tokens; ++kj) {
+        uint k_base = kj * pc.d_model + h * pc.head_dim;
+
+        float prod = 0.0;
+        if (lane < pc.head_dim) {
+            prod = Q[q_base + lane] * K[k_base + lane];
+        }
+
+        dot_part[lane] = prod;
+        memoryBarrierShared();
+        barrier();
+
+        // Reduce Q·K across the fixed 128-lane workgroup. Lanes above head_dim
+        // contributed zero, so non-power-of-two head sizes such as 72 are safe.
+        for (uint stride = MAX_HD >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                dot_part[lane] += dot_part[lane + stride];
+            }
+            memoryBarrierShared();
+            barrier();
+        }
+
+        float score = dot_part[0] * pc.scale;
+        float m_new = max(m, score);
+        float alpha = exp(m - m_new);
+        float beta  = exp(score - m_new);
+
+        if (lane < pc.head_dim) {
+            acc = acc * alpha + beta * V[k_base + lane];
+        }
+        l = l * alpha + beta;
+        m = m_new;
+
+        // Keep every lane inside this (head, query) workgroup together before
+        // dot_part is reused for the next key token.
+        barrier();
+    }
+
+    if (lane < pc.head_dim) {
+        O[q_base + lane] = (l > 0.0) ? (acc / l) : 0.0;
+    }
+}
