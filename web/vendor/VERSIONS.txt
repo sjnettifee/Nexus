@@ -1,0 +1,15 @@
+Document readers for the Nexus web chat. They run in the browser; the Nexus server serves this folder at /vendor/.
+Fetched from npm, unmodified:
+
+pdfjs/                         pdfjs-dist 3.11.174 (legacy build: pdf.min.js, pdf.worker.min.js, cmaps, standard_fonts)  Apache-2.0
+tesseract/tesseract.min.js     tesseract.js 5.1.1                                                                         Apache-2.0
+tesseract/worker.min.js        tesseract.js 5.1.1                                                                         Apache-2.0
+tesseract/core/                tesseract.js-core 5.1.1 (LSTM-only engine, with and without SIMD)                         Apache-2.0
+tesseract/lang/eng.traineddata.gz   @tesseract.js-data/eng 1.0.0 (4.0.0_best_int)                                        Apache-2.0 (Tesseract tessdata)
+mammoth.browser.min.js         mammoth 1.8.0   (.docx)                                                                    BSD-2-Clause
+xlsx.full.min.js               xlsx (SheetJS) 0.18.5   (.xlsx .xls .ods)                                                   Apache-2.0
+jszip.min.js                   jszip 3.10.1   (.pptx .odt .odp .epub)                                                      MIT (dual MIT / GPL-3.0-or-later; used under MIT)
+
+More OCR languages: put <code>.traineddata.gz (e.g. deu, fra, spa from @tesseract.js-data/<code>, folder 4.0.0_best_int)
+into tesseract/lang/ and pick them in the web chat's OCR language box (for example "eng+deu").
+License texts: LICENSES/.
