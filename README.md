@@ -22,6 +22,7 @@ alone. No cloud, no subscription, nothing leaves your machine.
 of what Nexus does and why, with a real-hardware benchmark.
 📘 **[The Nexus Guide](docs/NEXUS_GUIDE.md)**: everything in one place, from
 the first start to every server flag and API endpoint.
+**[Get nxm models (huggingface)](https://huggingface.co/collections/snettifee/nexus-models)**
 
 ## What it does on ordinary hardware
 
