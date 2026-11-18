@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased: first public release
+## 1.0.1
+
+### Mixture-of-experts models on the graphics cards
+- **MoE models (Qwen3.6-35B-A3B and others) now use the cards.** The attention part of every layer runs on its card. The experts stay in RAM, and the ones that matter get a copy on the cards. For each token, every card runs the experts it holds in one go, while the CPU runs the rest at the same time. In 1.0.0, MoE layers ran entirely on the CPU. See `docs/MOE_MODELS.md`.
+- **Two ways to choose the experts** (launcher *Experts on the cards (MoE models)*, `--moe-experts`):
+  - *Picked by each prompt* (default): after a prompt is read, the experts it used most move onto the cards. Re-checked every 256 written tokens.
+  - *Fixed home*: placed at load and never moved. Either whole layers until the cards are full, or N experts of every layer (`--moe-home`).
+  - *CPU only*.
+- **Prompts on MoE models get the prompt speed-up.** Each expert runs once over all the tokens that picked it: on the card that holds it, streamed through the prompt card when enough tokens picked it, or on the CPU alongside the cards. In 1.0.0 these prompts were read one token at a time.
+- The prompt card (Maximize GPU) holds experts too. They step aside while a prompt is read and come back after it.
+- Measured on a Qwen3.6-35B-A3B GGUF with 25 GB of RAM: about 6 tokens/s writing on a GTX 1060 3 GB + R9 290 4 GB. On the GTX 1060 alone: over 40 tokens/s reading the prompt and about 5 tokens/s writing, sustained through a 10,000-token reply.
+- Experts on the CPU run through the normal fast matrix code. Before, each one went row by row and started thousands of threads per token.
+- With Maximize GPU, the second card now fills with experts. Before, a 35B-A3B's attention parts (1.3 GB) all fit on card 1, and card 2 had nothing to hold.
+- Experts are always kept in RAM, even in layers on a card, because the CPU computes the ones that aren't on a card. Maximize GPU now sizes a MoE layer by its card part only, not counting its experts.
+
+### GGUF files made by llama.cpp (Qwen 3.5 / 3.6)
+- **They load.** Current llama.cpp merges two pairs of tensors in every Qwen 3.5 layer (`attn_qkv_gate`, `ssm_beta_alpha`). Nexus now reads each half in place, with no copy, for any quant type. Before, these files failed with `missing standard attention weights`.
+- **9B / 27B GGUFs compute correctly.** When a model has more value heads than key heads, llama.cpp stores the value heads in a different order. Nexus detects which order a file uses and uses it on the CPU and on every card. Before, every value head would have been paired with the wrong key head. Nexus `.nxm` files and Training Ground GGUFs keep their own order. `NEXUS_QWEN35_V_ORDER=tiled|grouped` overrides the detection.
+- Older Qwen3-Next GGUFs with a fused `ssm_ba` tensor are split for the card instead of sending the layer to the CPU.
+- **Fixed: Q4_0 and Q5_0 weights were decoded in the wrong order**, which gave wrong results wherever they appeared. llama.cpp's Q4_K_M uses Q5_0 for some MoE expert matrices. Also fixed in Training Ground.
+
+### Your own system prompt
+- **System prompt** setting per model in the launcher (next to *Chat format*): *The model's usual one* or *My own*, a text box of any length. It's used whenever a chat doesn't send its own; the web chat's System Prompt box still wins. Works for every chat format. Server: `--system-prompt <text>`, `--system-prompt-file <path>`.
+- Fixed: the Qwen3 chat format told every model using it that it was "Qwen, created by Alibaba Cloud". That line is now only used for models whose name says Qwen; other models get "You are a helpful assistant."
+
+### Graphics cards
+- **One number for card memory: *GPU prompt processing space* (MB, default 768).** Every card, in every mode, takes the whole layers that fit in what it really has free, minus this number. The same number is the room a prompt gets on the prompt card. It replaces *Card memory always kept free*, *Prompt card: memory for reading a prompt* and *Prompt working space on the card*. A number you set is used exactly.
+- Fixed: with Maximize GPU on the prompt card, card 2 was filled first and took the layers card 1 should have had. Card 1 now always claims its share first.
+- **The output matrix (lm_head) goes on a card** (launcher *Output matrix (lm_head)*, `--lm-head first|after|cpu`). *On the fastest card first* (default) times every card's read speed and puts it on the fastest card with room. If none has room, that card hands back just enough layers. Heads in types with no card kernel, or slow ones, are converted to 8-bit once. Before, the head ran on the CPU for every token unless the whole model was on card 1.
+- Fixed: Qwen 3.5 layers on a card ran on the CPU anyway, because two small BF16 tensors had no card kernel. They're now widened once at load. Together with the output-matrix change above, writing on a two-card 9B went from about 3 to about 17 tokens/s.
+- Fixed: the conversation state of layers on a second card was never read back, so the next turn could continue from stale state.
+- Layers on different cards are chained without waiting, card to card.
+- The log says where every layer ran and why the CPU took any (`[decode]` placement report), and prints the time per written token once writing is under way.
+
+## 1.0.0: first public release (2026-11-14)
 
 ### Conversation memory
 - Forget, archive (A1, A2, …) and restore any part of a conversation from the web chat, using the **⋯** menu on each message. There's also a **Memory** tab with usage, limit and the saved archives. See `docs/CONVERSATION_MEMORY.md`.

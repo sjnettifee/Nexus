@@ -2,7 +2,7 @@
 
 Nexus splits a model between your CPU and as many graphics cards as you give it. Older cards count too: a $20 AMD R9 290 next to a 3 GB GTX 1060 runs a 27B model faster than either one can alone.
 
-This page covers how the work is shared out, what every speed setting does, how to read the log, and how to set up the hardware. To use a card's memory as extra room for very long prompts, see [MAXIMIZE_GPU.md](MAXIMIZE_GPU.md).
+This page covers how the work is shared out, what every speed setting does, how to read the log, and how to set up the hardware. To use a card's memory as extra room for very long prompts, see [MAXIMIZE_GPU.md](MAXIMIZE_GPU.md). For mixture-of-experts models (Qwen3.6-35B-A3B and similar), see [MOE_MODELS.md](MOE_MODELS.md).
 
 ---
 
@@ -24,6 +24,8 @@ There are two jobs, and they use the cards differently:
 
 So adding a second card speeds up **writing** (more layers on fast card memory, fewer on the CPU) and makes long prompts easier on the computer, because the load is split. **Prompt** reading stays on one card.
 
+After the last layer, the **output matrix** (lm_head) turns the result into the next word. It's one of the biggest single weights in a model and it's read for every token, so by default it goes on the fastest card that has room (*Output matrix (lm_head)*, below).
+
 ---
 
 ## Setting up the cards
@@ -33,7 +35,10 @@ So adding a second card speeds up **writing** (more layers on fast card memory, 
 - **Graphics card 1, 2, 3, …**: a new row appears each time you pick a card. Layers go in order: card 1 gets the first ones, then card 2, and so on. The rest run on the CPU.
 - **How card N holds its layers**:
   - *A set number*: exactly that many layers, as typed in the layers field.
-  - *Maximize GPU: as many as fit*: Nexus measures the card's real free memory and fills it, keeping *Card memory always kept free*. Details in MAXIMIZE_GPU.md.
+  - *Maximize GPU: as many as fit*: Nexus measures the card's real free memory and fills it, keeping *GPU prompt processing space* free. Details in MAXIMIZE_GPU.md.
+- **GPU prompt processing space (MB)**, default 768: the one memory number for every card. Each card takes the whole layers that fit in what it really has free, minus this. On the prompt card, it's also the room a prompt gets. A number you type is used exactly. Raise it to 1024 if the desktop runs on a card or you see out-of-memory messages.
+- **Output matrix (lm_head)**: *On the fastest card first* (default) / *On a card only if there's room* / *Keep on the CPU*. See below.
+- **Experts on the cards (MoE models)**: *Picked by each prompt* (default) / *Fixed home* / *CPU only*. Only for mixture-of-experts models. See [MOE_MODELS.md](MOE_MODELS.md).
 - **8-bit prompt math on card N**: Auto / On / Off, chosen per card. See *8-bit math* below.
 - **CPU threads**: for the layers that run on the CPU.
 - **CPU: 8-bit output math**: Auto / Off / On. See *8-bit math* below.
@@ -52,7 +57,7 @@ If a set number doesn't fit, the card takes as many layers as fit and the log sa
 - **Card to use**: the card that reads prompts. Pick your fastest card that has the best PCIe link (see *Slots and lanes*). It can also hold layers for writing.
 - **Layers swapped through the card at once**, **Attention path**: leave these on their defaults unless you're experimenting.
 - **8-bit prompt math on this card**: shown only when the prompt card isn't one of the cards in *Run on graphics card(s)*. Otherwise its row up there holds the setting.
-- **Split long prompt steps** and **Prompt working space on the card**: see below.
+- **Split long prompt steps**: see below.
 
 Every setting with a **?** next to its name has a note. Hover over the **?** to read it, or click to keep it open.
 
@@ -81,9 +86,9 @@ Whether it's actually faster depends on the hardware, so every place it applies 
 | Setting | Choices (default first) | What it does | Command line |
 |---|---|---|---|
 | Split long prompt steps | **Auto (AMD cards only)** / On / Off | If one step of a long prompt takes over 3 s, the rest of that layer runs in smaller steps (never below 256 tokens). AMD's Linux driver resets a card after 10 s on one job. Other cards don't need it, and smaller steps are slower. | `NEXUS_PREFILL_TILE_MAX_S=3` (on) / `0` (off); `NEXUS_PREFILL_TILE_MIN` |
-| Prompt working space on the card | **Fit to what's really free** / By the card's size | How much of the prompt card the prompt speed-up may fill. *Really free* leaves room for the desktop and for long chats (attention needs about 400 MB per layer at 100,000 tokens). *By the card's size* is fuller and can run out. | `NEXUS_TURBO_BUDGET_REAL=0` = by size |
-| Card memory always kept free | **768** MB | Left free on every Maximized card. Raise it to 1024 if the desktop runs on that card or you see out-of-memory messages. | `--park-keep-mb` |
-| Prompt card: memory for reading a prompt | **auto** / a number in MB | With Maximize on the prompt card: how much room a prompt gets. *Auto* clears just enough. A number bigger than the card clears every Maximize layer off it for each prompt. | `--park-prefill-free-mb` |
+| GPU prompt processing space | **768** MB | Never filled with layers, on every card: whole layers that fit in (really free − this) go on. On the prompt card, also the room a prompt gets. Replaces 1.0.0's *Card memory always kept free*, *Prompt card: memory for reading a prompt* and *Prompt working space on the card*. | `--park-keep-mb` (the launcher also sends it as `--park-prefill-free-mb`) |
+| Output matrix (lm_head) | **On the fastest card first** / On a card only if there's room / Keep on the CPU | *First*: each card's read speed is timed at startup, and the head goes on the fastest card with room. If none has room, that card hands back just enough of its last layers. *Only if there's room*: never moves a layer for it. A head in a type with no card kernel, or a slow one, is converted to 8-bit (Q8_0) once. | `--lm-head first\|after\|cpu` |
+| Experts on the cards (MoE models) | **Picked by each prompt** / Fixed home / CPU only | Which experts of a mixture-of-experts model get a copy on the cards. See MOE_MODELS.md. | `--moe-experts prompt\|home\|off`, `--moe-home N\|all` |
 | Speculative decoding (MTP) | **Off** / On, tokens per step, draft on CPU / card | See below. | `--mtp`, `--mtp-n-predict`, `--mtp-gpu` |
 
 ---
@@ -134,6 +139,7 @@ Cards often drop to a slower link when idle to save power, so check while a prom
 
 ## Memory safety on the cards
 
+- **Putting layers on a card**, every card in every mode uses one rule: whole layers that fit in (what the card really has free − *GPU prompt processing space*). A layer that would go over is left off. Card 1 always claims its share before card 2, 3, ….
 - **While reading a prompt**, the prompt speed-up only fills what the card *really* has free (the driver reports it), minus room for attention that grows with the conversation, minus a safety margin. The log says `[turbo:auto-budget] … source=real-free`.
 - **While writing**, every 128 tokens: if the prompt card has less than 256 MB really free, one Maximize layer moves to RAM. If card 2, 3, … has less than 256 MB free, its last layer goes back to the CPU. The log says which.
 - **MTP drafting on the card** gets its own room on the prompt card.
@@ -154,7 +160,11 @@ Cards often drop to a slower link when idle to save power, so check while a prom
 | `[prefill] layer N: a ...-token slice took ... s ...; smaller slices ...` | *Split long prompt steps* kicked in |
 | `[park] ...` | Maximize GPU / protection moving layers (see MAXIMIZE_GPU.md) |
 | `[nexus] graphics card ... is nearly full while writing ...` | The watcher gave a layer back to the CPU |
-| `[vulkan] cache full and nothing it can evict ...` | The card is completely full. Raise *Card memory always kept free*. |
+| `[decode] where each layer was written ...` then `[decode]   layers 0-31 -> ...` | Once per run: where each layer was computed while writing, and the reason whenever the CPU took one |
+| `[decode] time per written token (avg of 8): layers ... ms + final norm/lm_head on ... ms` | Once, after the 10th written token: where the time goes |
+| `how fast each card reads weights while writing` | Each card's measured read speed, used to place the output matrix and MoE experts |
+| `[moe] ...`, `[moe:prompt] ...` | Mixture-of-experts placement and prompt split (see MOE_MODELS.md) |
+| `[vulkan] cache full and nothing it can evict ...` | The card is completely full. Raise *GPU prompt processing space*. |
 | `[mtp-time] ...`, `[mtp-diag] ... MATCH / miss` | MTP timing and which guesses were kept |
 
 ---
@@ -163,7 +173,8 @@ Cards often drop to a slower link when idle to save power, so check while a prom
 
 - **A helper card stays empty.** Look for its `[nexus] graphics card N …` line at load. A "doesn't fit" message means it had less free memory than the layers need, so lower its layer count or use Maximize.
 - **Prompts got slower after adding a card.** Check the prompt card's PCIe link (see *Slots and lanes*).
-- **Out-of-memory messages, or the card sits right at its limit.** Set *Card memory always kept free* to 1024, keep *Prompt working space* on "really free", and if the desktop runs on that card, give it a little more.
+- **Out-of-memory messages, or the card sits right at its limit.** Set *GPU prompt processing space* to 1024, and a little more if the desktop runs on that card.
+- **Layers on a card but writing is slow.** Read the `[decode]` placement line: it names every layer range the CPU computed and why.
 - **An AMD card resets during a long prompt** ("context is lost"). Set *Split long prompt steps* to On.
 - **MTP is slower than writing without it.** On CPU-heavy splits, that's expected. Try 2 drafts, try *CPU: 8-bit output math* on Auto, or turn MTP off.
 - **Prompt reading is slower than expected on an NVIDIA card.** Make sure its *8-bit prompt math* isn't set to Off, and check the `[vulkan] 8-bit prompt math` line.

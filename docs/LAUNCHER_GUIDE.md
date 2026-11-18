@@ -174,10 +174,26 @@ gets the first ones, then card 2, and so on. The rest run on the CPU.
   keeps the faster.
 - **Graphics card 2, 3, …**: a new row appears each time you pick a card,
   with the same settings.
-- With Maximize on any card, two more settings appear:
-  - **Card memory always kept free (MB)**, default 768. Raise it to 1024
-    if your desktop runs on that card.
-  - **Prompt card: memory for reading a prompt (MB)**, default *auto*.
+- When any card is in use, one row of shared settings appears:
+  - **GPU prompt processing space (MB)**, default 768. The only card
+    memory number: every card takes the whole layers that fit in what it
+    really has free, minus this. On the prompt card it's also the room a
+    prompt gets. A number you type is used exactly. Raise it to 1024 if
+    your desktop runs on a card. (It replaces 1.0.0's *Card memory
+    always kept free*, *Prompt card: memory for reading a prompt* and
+    *Prompt working space on the card*.)
+  - **Output matrix (lm_head)**: *On the fastest card first* (default),
+    *On a card only if there's room* or *Keep on the CPU*. The output
+    matrix is read for every token, so it pays to have it on a card.
+    *First* times every card at startup and uses the fastest one with
+    room. If none has room, that card gives back just enough layers.
+  - **Experts on the cards (MoE models)**: *Picked by each prompt*
+    (default), *Fixed home* or *CPU only*. Only mixture-of-experts models
+    use it. With *Fixed home*, **Home experts per layer** appears: *all*
+    (whole layers until the cards are full) or a number. See
+    [MOE_MODELS.md](MOE_MODELS.md).
+- With Maximize on, that card's layer count is ignored (the box greys
+  out). Without it, a typed count is loaded exactly as typed.
 - **CPU: 8-bit output math**: *Off* (default, full precision), *Auto*
   (measured on this CPU at the first token; kept only if at least 10%
   faster) or *On*. It applies to NQ models while writing.
@@ -209,8 +225,6 @@ live.
   isn't already one of the cards above (then its row there holds it).
 - **Split long prompt steps**: *Auto (AMD cards only)*, *On* or *Off*.
   Keeps each step under the AMD Linux driver's time limit.
-- **Prompt working space on the card**: *Fit to what's really free*
-  (default, safer) or *By the card's size* (older, fuller).
 - **Oversized-prompt protection** and **Drop layers from RAM below (MB
   free)**: when free RAM falls under the number while a prompt is read,
   layers move off RAM and onto the card afterwards, instead of the
@@ -233,6 +247,11 @@ computers on your network. See *Multi-computer setup* below.
   chat template has a thinking switch.
 - **Custom** chat format shows seven text fields (before everything,
   before/after system, before/after user, before/after model).
+- **System prompt**: *The model's usual one* (what its chat format
+  normally uses) or *My own*, which opens a text box of any length.
+  Empty means no system prompt at all. It's used whenever a chat doesn't
+  send its own system prompt; the web chat's System Prompt box still
+  wins. Newlines and quotes are kept. Works with every chat format.
 - All of this is remembered **per model file**, separately from profiles.
 
 #### Conversation memory

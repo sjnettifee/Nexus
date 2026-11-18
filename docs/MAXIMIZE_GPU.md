@@ -4,7 +4,7 @@ Two ways to use a graphics card's memory as extra room for the model, so a long 
 
 Both keep the **prompt speed-up** (prefill acceleration): while a prompt is read, the card has the room the speed-up needs, and once the prompt is read, layers are put on the card for writing. Linux only.
 
-For setting up several cards, the 8-bit options and the other speed settings, see [GRAPHICS_CARDS_AND_SPEED.md](GRAPHICS_CARDS_AND_SPEED.md).
+For setting up several cards, the 8-bit options and the other speed settings, see [GRAPHICS_CARDS_AND_SPEED.md](GRAPHICS_CARDS_AND_SPEED.md). For mixture-of-experts models, whose experts can share the Maximize card, see [MOE_MODELS.md](MOE_MODELS.md).
 
 ---
 
@@ -32,20 +32,22 @@ Every card in the list has its own setting: **A set number** (the layers field, 
 
 What Maximize does depends on the card:
 
-- **Any card that isn't the prompt speed-up card:** as many layers as fit go onto it and stay there (`--gpu2-layers auto`, `--gpu3-layers auto`, …). The amount is measured from the card's real free memory, keeping *Card memory always kept free*. These layers stream through the prompt card while a prompt is read, like any other card's layers, so nothing moves on or off them.
+- **Any card that isn't the prompt speed-up card:** as many layers as fit go onto it and stay there (`--gpu2-layers auto`, `--gpu3-layers auto`, …). The amount is measured from the card's real free memory, keeping *GPU prompt processing space* free. These layers stream through the prompt card while a prompt is read, like any other card's layers, so nothing moves on or off them.
 - **The prompt speed-up card:** its layers live there for writing **with no copy in RAM**, and move off only as far as a prompt needs (below).
 
-The cards are filled in order: the other cards first, then the prompt card takes as many of the remaining layers as fit.
+The cards are filled in order: **the prompt card claims its share first**, then card 2, 3, … take as many of the remaining layers as fit. (In 1.0.0, card 2 was filled first and could take layers the prompt card should have had.)
+
+**Mixture-of-experts models:** experts can sit on the prompt card next to its layers. They step aside while a prompt is read and come back with the layers. See MOE_MODELS.md.
 
 **MTP:** if *Speculative decoding (MTP) → Draft on: Graphics card* is on, MTP drafts on the prompt card. Maximize leaves room there for the MTP head (the log says `[park] keeping N MB free on the card for MTP drafting`), so it doesn't fight the layers for space.
 
-When a prompt is read, the prompt card needs room for the prompt speed-up (*Prompt card: memory for reading a prompt*: **auto** works out exactly what it needs, or set a number, e.g. 1536; a number bigger than the card clears every Maximize layer off it for each prompt). If that room is already free, nothing moves. If not, **just enough layers move off** to make it. The rest stay on the card, and the prompt is read through them there. Afterwards, the moved ones go back on, with a pause while they load from the drive.
+When a prompt is read, the prompt card needs room for the prompt speed-up: *GPU prompt processing space* (768 MB by default, or what you set; a number bigger than the card clears every Maximize layer off it for each prompt). If that room is already free, nothing moves. If not, **just enough layers move off** to make it. The rest stay on the card, and the prompt is read through them there. Afterwards, the moved ones go back on, with a pause while they load from the drive.
 
 This room is **only what the prompt speed-up uses plus this conversation's memory (KV) at its new length**, not the whole card. The layers that fit beside it stay put.
 
 Example: on a 12 GB card, about 10 GB of layers live on the card. A prompt moves about 1.5 GB of them off, is read, and they go back. Most of the writing then happens on the fast card.
 
-With "as many as fit", the card is full, so most prompts move a few layers and pause. To avoid the pause, set *Prompt card: memory for reading a prompt* to a number: that much stays free from the start, and nothing moves.
+Layers are only put on beside that same number, so most prompts find their room already free and move nothing. Long prompts need more room for attention and move a few layers. To make those pauses rarer, raise *GPU prompt processing space*: more stays free from the start, and fewer layers live on the card.
 
 ### Oversized-prompt protection
 
@@ -68,11 +70,11 @@ You can use both modes together.
 
 ## Card memory: what's really free
 
-When the graphics driver supports it (`VK_EXT_memory_budget`, which most current drivers do), Nexus asks the card how much is **really** free, counting your desktop and every buffer Nexus has made. Layers only go on while that leaves *Card memory always kept free*. Filling a card past its real memory either fails or makes the driver quietly spill into system RAM, after which everything on the card crawls.
+When the graphics driver supports it (`VK_EXT_memory_budget`, which most current drivers do), Nexus asks the card how much is **really** free, counting your desktop and every buffer Nexus has made. Layers only go on while that leaves *GPU prompt processing space* free. Filling a card past its real memory either fails or makes the driver quietly spill into system RAM, after which everything on the card crawls.
 
-Without driver support, Nexus estimates from the card's size. The log says *(estimated)*, and it's worth raising the kept-free number if your desktop runs on the same card.
+Without driver support, Nexus estimates from the card's size. The log says *(estimated)*, and it's worth raising *GPU prompt processing space* if your desktop runs on the same card.
 
-**While reading a prompt**, the prompt speed-up's working space on the card is capped at what the card *really* has free, minus room for attention. That room grows with the conversation (about 400 MB per layer at 100,000 tokens), minus a safety margin. *Prompt speed-up → Prompt working space on the card → By the card's size* switches back to the older, fuller sizing.
+**While reading a prompt**, the prompt speed-up's working space on the card is capped at what the card *really* has free, minus room for attention. That room grows with the conversation (about 400 MB per layer at 100,000 tokens), minus a safety margin. `NEXUS_TURBO_BUDGET_REAL=0` switches back to the older, fuller sizing by the card's total memory.
 
 **While writing**, every 128 tokens:
 - If the prompt card's real free memory falls under 256 MB, one parked layer moves off it into RAM.
@@ -83,11 +85,10 @@ Without driver support, Nexus estimates from the card's size. The log says *(est
 
 | Setting (launcher) | Server flag | Default | Meaning |
 |---|---|---|---|
-| How card N holds its layers: Maximize GPU (prompt card) | `--park-layers N\|auto` | off | N layers (auto = as many as fit) live on the prompt card for writing. The launcher sends `--gpu-layers 0` with it. |
+| How card N holds its layers: Maximize GPU (prompt card) | `--gpu-layers auto` | set number | As many layers as fit go on the prompt card, and those same layers are the ones that move for prompts. The launcher no longer sends `--park-layers`; the server parks exactly what card 1 got. `--park-layers N\|auto` still works on the command line. |
 | How card N holds its layers: Maximize GPU (other cards) | `--gpu2-layers auto`, `--gpu3-layers auto`, … | set number | As many layers as fit on that card, kept there. |
 | Oversized-prompt protection | `--park-below-mb MB` | off | Drop layers from RAM while reading when free RAM is under this. |
-| Prompt card: memory for reading a prompt | `--park-prefill-free-mb MB\|auto` | auto | Room the prompt speed-up gets on the prompt card. Layers move off only when it isn't free already. |
-| Card memory always kept free | `--park-keep-mb MB` | 768 | Left free on every Maximized card (activations, the GPU copy of the conversation memory). MTP drafting on the card gets its own room on top. |
+| GPU prompt processing space | `--park-keep-mb MB` and `--park-prefill-free-mb MB` (the launcher sends the same number to both) | 768 | Never filled with layers, on every card. On the prompt card, also the room a prompt gets; layers move off only when it isn't free already. MTP drafting on the card gets its own room on top. On the command line, `--park-prefill-free-mb auto` works out what each prompt needs instead. |
 | (server only) | `--park-min-tokens N` | 0 (off) | Optional: prompts shorter than N never move layers and are read on the CPU instead. |
 
 Both modes need the prompt speed-up on (`--turbo-prefill`) with a discrete card. They are off for integrated graphics (it shares RAM, so nothing is freed) and when this computer runs only part of the model (shared with donors). Other cards can hold layers at the same time, set or Maximized.

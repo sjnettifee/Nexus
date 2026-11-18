@@ -80,14 +80,18 @@ template guesses wrong, or the model has no template at all)
 |---|---|
 | `--chat-format <fmt>` | Force a format: `ChatML`, `Qwen3`, `Mistral`, `Mistral V3`, `Llama-3`, `DeepSeek`, `DeepSeek-R1`, `DeepSeek-Coder`, `Phi-3`, `Phi-4`, `Gemma`, `Gemma4`, `Zephyr`, `Alpaca`, `Granite`, `OLMoE`, `Custom`, `Raw` |
 | `--chat-custom-pre-prompt/-pre-system/-end-system/-pre-user/-end-user/-pre-model/-end-model <s>` | Build a one-off format out of literal fragments (only used with `--chat-format Custom`) |
+| `--system-prompt <text>` / `--system-prompt-file <path>` | System prompt used whenever a request sends none, for every chat format (empty = none). A request's own system message always wins |
 
 **GPU placement**
 | Flag | Meaning |
 |---|---|
-| `--gpu-layers <n>` | Layers to put on the primary GPU (the first card; with the prompt speed-up on, the card that reads prompts) |
+| `--gpu-layers <n\|auto>` | Layers to put on the primary GPU (the first card; with the prompt speed-up on, the card that reads prompts). `auto` = as many as really fit, keeping `--park-keep-mb` free. Card 1 always claims its share before card 2, 3, … |
 | `--gpu-device <idx or name:...>` | Which Vulkan device; accepts a raw index or `name:<card name>[#n]` (the n-th card with that name). Names are safer: on laptops with two graphics systems the index order can change between programs and starts |
 | `--gpu2-layers <n\|auto>` / `--gpu2-device` | Second GPU. `auto` = as many layers as really fit, keeping `--park-keep-mb` free |
 | `--gpu3-layers` / `--gpu3-device`, `--gpuN-layers` / `--gpuN-device` | Any further GPUs (N ≥ 3), same rules |
+| `--lm-head <first\|after\|cpu>` | Output matrix placement: `first` (default) = the fastest card with room, giving back just enough layers if none has room; `after` = a card only if there's room; `cpu` |
+| `--moe-experts <prompt\|home\|off>` | Mixture-of-experts models: which experts get a copy on the cards (default `prompt` = the experts each prompt used, moved after it's read). See [MOE_MODELS.md](MOE_MODELS.md) |
+| `--moe-home <N\|all>` | With `--moe-experts home`: N experts of every layer, or whole layers until the cards are full (default `all`) |
 | `--list-devices` | Print Vulkan devices and exit |
 | `--probe` | Print a hardware/GPU JSON probe and exit — no model needed |
 
@@ -95,10 +99,10 @@ template guesses wrong, or the model has no template at all)
 `--turbo-prefill`; see [MAXIMIZE_GPU.md](MAXIMIZE_GPU.md))
 | Flag | Meaning |
 |---|---|
-| `--park-layers <N\|auto>` | Maximize GPU on the prompt card: N layers (auto = as many as fit) live there for writing, with no copy in RAM |
+| `--park-layers <N\|auto>` | Maximize GPU on the prompt card: N layers (auto = as many as fit) live there for writing, with no copy in RAM. Without it, the layers card 1 got from `--gpu-layers` are parked (what the launcher does) |
 | `--park-below-mb <MB>` | Oversized-prompt protection: drop layers from RAM while a prompt is read whenever free RAM is under this |
 | `--park-prefill-free-mb <MB\|auto>` | Card memory the prompt speed-up gets while a prompt is read (default auto = what it needs) |
-| `--park-keep-mb <MB>` | Card memory always left free when putting layers on a card (default 768) |
+| `--park-keep-mb <MB>` | GPU prompt processing space: card memory never filled with layers, on every card (default 768). Whole layers that fit in (really free − this) go on. A given number is used exactly |
 | `--park-min-tokens <N>` | Optional: prompts shorter than N never move layers (default 0 = no such rule) |
 
 **Conversation memory** (see [CONVERSATION_MEMORY.md](CONVERSATION_MEMORY.md))
@@ -174,6 +178,7 @@ the [Nexus Guide](NEXUS_GUIDE.md#environment-variables).
 | `NEXUS_MEM_GUARD=0`, `NEXUS_MEM_BUFFER_MB` | Memory safety buffer off, or how much RAM it keeps free (default 1024) |
 | `NEXUS_MM_INT8_CARDS` | 8-bit prompt math per card, e.g. `NVIDIA GeForce GTX 1060 3GB=1;AMD Radeon R9 200 Series (RADV HAWAII)=0` |
 | `NEXUS_CPU_INT8` | CPU 8-bit output math: `1`, `auto`, or unset (off) |
+| `NEXUS_MOE_STREAM_MIN`, `NEXUS_MOE_RECHECK` | Mixture-of-experts tuning (see [MOE_MODELS.md](MOE_MODELS.md)) |
 | `NEXUS_HYBRID_PREFILL` | Toggles the hybrid prefill path server-side |
 | `NEXUS_VISION_MODE` | Overrides vision-encoder behavior |
 | `NEXUS_WEB_IMAGE_MAX_EDGE` | Max image edge (pixels) the server will accept via `/api/image/upload` before downscaling |
@@ -537,7 +542,17 @@ engine.set_gpu2_layers(n);           // second device
 engine.add_gpu_layers(dev_index, n); // generic, any device index
 engine.gpux_device_name(idx);
 nexus::Engine::list_gpu_devices();   // static — enumerate Vulkan devices
+
+// mixture-of-experts models, before the first forward pass:
+// mode 0 = CPU only, 1 = fixed home (home_n experts per layer, -1 = whole layers), 2 = picked by each prompt
+engine.set_moe_experts(2, -1);
 ```
+
+The output matrix's card follows `NEXUS_LMHEAD_MODE` (`first` /
+`after` / `cpu`), which is what `--lm-head` sets.
+
+`engine.set_system_prompt(text)` sets the system prompt used whenever a
+chat sends none (any format; empty text = no system prompt).
 
 ### 4.4 Streaming generation: `GenerateSession`
 

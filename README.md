@@ -26,16 +26,21 @@ the first start to every server flag and API endpoint.
 
 ## What it does on ordinary hardware
 
-The development machine is a desktop with **25 GB of DDR4** and a **3 GB GTX 1060**
-from 2016. On it, Nexus runs
+The development machine is a desktop with **25 GB of DDR4**, a **3 GB GTX 1060**
+from 2016 and a **$20 AMD R9 290** added as a helper card. On it, Nexus runs
 **Qwen 3.6 27B** (4-bit):
 
 - an **11,400-token prompt read in about 4½ minutes** (~42 tokens per second),
 - prompts of **60,000 tokens** still read at over 30 tokens per second,
-- **over 1 token per second** of writing afterwards,
+- a steady **2 tokens per second** of writing afterwards,
 - and the computer stays usable the whole time.
 
-None of that hardware was meant to run a 27-billion-parameter model.
+On the same machine, the mixture-of-experts **Qwen3.6-35B-A3B** writes about
+**6 tokens per second**. With the GTX 1060 alone, it reads prompts at over 40
+tokens per second and writes about 5 tokens per second through a
+10,000-token reply.
+
+None of that hardware was meant to run models this size.
 
 ## What makes it different
 
@@ -77,9 +82,10 @@ PDFs, Word files, spreadsheets, slides, e-books, RTF and web pages are read as t
 - **Maximize GPU:** fill each card with as many layers as really fit, or set the number per card. Long prompts still get the prompt speed-up.
 - **Oversized-prompt protection:** when RAM runs short while reading a prompt, layers move to the card instead of the system swapping.
 - **Measured, not guessed:** each card's 8-bit math and the CPU's 8-bit option can be left on Auto, which times both ways on your hardware and keeps the faster. Every speed setting has an on/off switch and a **?** explaining it.
+- **Mixture-of-experts models on small cards:** attention runs on the cards, and the experts each prompt uses are moved onto them after it's read. Or keep a fixed set there. The CPU runs the rest at the same time.
 - **Lossless speculative decoding (MTP)** for models that have draft heads.
 
-See **[docs/GRAPHICS_CARDS_AND_SPEED.md](docs/GRAPHICS_CARDS_AND_SPEED.md)** and **[docs/MAXIMIZE_GPU.md](docs/MAXIMIZE_GPU.md)**.
+See **[docs/GRAPHICS_CARDS_AND_SPEED.md](docs/GRAPHICS_CARDS_AND_SPEED.md)**, **[docs/MAXIMIZE_GPU.md](docs/MAXIMIZE_GPU.md)** and **[docs/MOE_MODELS.md](docs/MOE_MODELS.md)**.
 
 ## Safe on your network, easy to build on
 
@@ -121,6 +127,7 @@ Full walkthrough: **[Launcher Guide](docs/LAUNCHER_GUIDE.md)**.
 | [Launcher Guide](docs/LAUNCHER_GUIDE.md) | The launcher window, card by card. |
 | [Graphics cards and speed](docs/GRAPHICS_CARDS_AND_SPEED.md) | Several cards, 8-bit math, MTP, PCIe slots, reading the log. |
 | [Maximize GPU](docs/MAXIMIZE_GPU.md) | Using card memory as extra room for very long prompts. |
+| [MoE models](docs/MOE_MODELS.md) | Mixture-of-experts models: experts on the cards, picked by each prompt or kept in a fixed home. |
 | [Conversation memory](docs/CONVERSATION_MEMORY.md) | Limits, auto-trim, forget, archive, restore. |
 | [Documents in chat](docs/DOCUMENTS_IN_CHAT.md) | PDF, Word, spreadsheets, slides, OCR. |
 | [Access and API keys](docs/ACCESS_AND_API_KEYS.md) | Who can connect, API keys, building your own app. |
@@ -190,16 +197,25 @@ support. Linux, macOS, or Windows (MSYS2 MinGW64 shell):
 ```sh
 scripts/build_release.sh            # builds CPU tiers v2 v3 v4 -> ./dist
 scripts/build_release.sh v3         # just one tier
-OUT=/path/to/folder scripts/build_release.sh
+OUT="$PWD/server" NO_ROOT_COPY=1 scripts/build_release.sh   # straight into server/, the release layout
 ```
 
 This builds `nexus_server` (the small dispatcher every user actually
 runs: built without `-march`, works on any CPU) plus a
 `nexus_server_v2/v3/v4` + `libnexus_v2/v3/v4` pair for each CPU tier
 (SSE4.2 / AVX2+FMA / AVX-512). The dispatcher picks the best one your
-CPU supports at startup. Everything lands in `dist/` (and the project
-folder), ready to zip or copy to a USB stick. Ship the `web/` folder
-alongside it: it holds the document readers for the web chat.
+CPU supports at startup. By default everything lands in `dist/` and the
+project folder; `NO_ROOT_COPY=1` skips the project-folder copy.
+
+The launcher builds on its own:
+
+```sh
+cd nexusLauncher/src && ./build.sh
+```
+
+To assemble a release, put the launcher, the `server/` folder and `web/`
+side by side (see *What's in the repository* above); the server finds
+`web/vendor/` one folder up.
 
 Prefer driving CMake yourself:
 
@@ -208,10 +224,17 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEXUS_VULKAN=ON
 cmake --build build --parallel
 ```
 
-Useful CMake options: `-DNEXUS_TIER=v2|v3|v4|native`,
-`-DNEXUS_VULKAN=ON` (GPU support, off by default), `-DNEXUS_CUDA=ON`
-/ `-DNEXUS_ROCM=ON` (optional, off by default), `-DNEXUS_PYTHON=ON`
-(pybind11 bindings, off by default).
+Useful CMake options: `-DNEXUS_TIER=v2|v3|v4|native` (`native` is for
+testing on your own machine only; never ship it), `-DNEXUS_VULKAN=ON`
+(GPU support, off by default), `-DNEXUS_PYTHON=ON` (pybind11 bindings,
+off by default).
+
+The GPU shaders in `src/gpu/shaders/*.comp` are compiled at build time.
+The 8-bit (dp4a) kernels are prebuilt into `src/gpu/spirv_dp4a.h`,
+because the standard shader compilers can't emit the integer dot-product
+instruction; their sources are in `src/gpu/shaders/dp4a/` and
+`tools/patch_dp4a.py` rebuilds them (needs `spirv-dis`, `spirv-as`,
+`spirv-opt` and `spirv-val`).
 
 ## License
 

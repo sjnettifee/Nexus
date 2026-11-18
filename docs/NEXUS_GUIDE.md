@@ -10,6 +10,7 @@ section:
 [Launcher](LAUNCHER_GUIDE.md) ·
 [Graphics cards and speed](GRAPHICS_CARDS_AND_SPEED.md) ·
 [Maximize GPU](MAXIMIZE_GPU.md) ·
+[MoE models](MOE_MODELS.md) ·
 [Conversation memory](CONVERSATION_MEMORY.md) ·
 [Documents in chat](DOCUMENTS_IN_CHAT.md) ·
 [Access and API keys](ACCESS_AND_API_KEYS.md) ·
@@ -114,7 +115,9 @@ including a USB stick.
 
 - **GGUF** (`.gguf`), including split files (`-00001-of-00003.gguf`).
   Common types: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0, F16,
-  BF16. The IQ types (IQ2_XS, IQ4_XS and so on), Q4_1 and Q5_1 aren't
+  BF16. Qwen 3.5 / 3.6 GGUFs made by current llama.cpp (with its merged
+  tensors and its own value-head order) load and run on the cards since
+  1.0.1. The IQ types (IQ2_XS, IQ4_XS and so on), Q4_1 and Q5_1 aren't
   supported yet; the log shows `[nexus] UNSUPPORTED MODEL FORMAT` with
   the formats it found, instead of crashing.
 - **Nexus native** (`.nxm` single file, `.nxmodel` folder), made with the
@@ -128,7 +131,10 @@ architecture and the detected chat format when you pick a model.
 
 **Size.** The model must fit in RAM plus whatever your cards hold.
 Rough sizes at 4-bit: 7–9B ≈ 5 GB, 14B ≈ 9 GB, 27B ≈ 15–16 GB, 32B ≈
-19 GB. Then add the conversation memory, which depends on the model and
+19 GB. Mixture-of-experts models are the exception: all their experts
+stay in RAM even with cards, so a 35B-A3B needs about 20 GB of RAM, but
+it writes much faster than a dense model of that size (see
+[MOE_MODELS.md](MOE_MODELS.md)). Then add the conversation memory, which depends on the model and
 grows with the conversation (the Memory tab in the web chat shows the
 cost per token).
 
@@ -192,6 +198,20 @@ on top of the model. On Linux:
 
 Details: [MAXIMIZE_GPU.md](MAXIMIZE_GPU.md).
 
+### A mixture-of-experts model (Qwen3.6-35B-A3B and similar)
+
+- Cards as usual: the prompt card on **Maximize GPU**, helper cards on
+  **Maximize GPU**.
+- *Experts on the cards (MoE models)*: **Picked by each prompt** (the
+  default). After each prompt, the experts it used move onto the cards.
+- Enough RAM for the whole model file: the experts not on a card are
+  computed by the CPU.
+
+On the development machine below (25 GB RAM), a 35B-A3B GGUF writes
+about 6 tokens/s with both cards. With the GTX 1060 alone, it reads
+prompts at over 40 tokens/s and writes about 5 tokens/s, sustained
+through a 10,000-token reply. Details: [MOE_MODELS.md](MOE_MODELS.md).
+
 ### Two computers
 
 Main computer: the one with the better graphics card. Donor: anything
@@ -208,12 +228,15 @@ with spare RAM. See [Several computers, one model](#10-several-computers-one-mod
 | Graphics card 2 | R9 290, Maximize GPU, 8-bit prompt math Auto (off: measured slower) |
 | Prompt speed-up | On, card: GTX 1060 |
 | Split long prompt steps | Auto (the prompt card isn't AMD, so off) |
-| Card memory always kept free | 768 MB |
+| GPU prompt processing space | 768 MB |
 | MTP | Off (most layers run on the CPU, so drafts don't pay off here) |
 
-Result: an 11,400-token prompt in about 270 s, over 1 token/s writing,
-and the desktop stays responsive. With the GTX 1060 alone in the slot
-(x16 instead of x8), the same prompt took 251 s.
+Result: an 11,400-token prompt in about 270 s, and the desktop stays
+responsive. With the GTX 1060 alone in the slot (x16 instead of x8), the
+same prompt took 251 s. Writing was just over 1 token/s in 1.0.0. Since
+1.0.1 it's a stable 2 tokens/s, because every layer on a card really
+runs there and the output matrix sits on a card. A Qwen 3.5 9B on the
+same two cards writes about 17 tokens/s.
 
 ---
 
@@ -229,10 +252,10 @@ note.
 |---|---|
 | Model | Model file, folders to scan, profiles (named snapshots of every setting for one model). |
 | This computer | Hardware found, and whether each card is usable. |
-| Run on graphics card(s) | Layers per card (number or Maximize), 8-bit prompt math per card, CPU threads, CPU 8-bit output math. |
-| Prompt speed-up | On/off/Auto, prompt card, attention path, split long prompt steps, working space, oversized-prompt protection. |
+| Run on graphics card(s) | Layers per card (number or Maximize), 8-bit prompt math per card, GPU prompt processing space, output matrix placement, MoE experts, CPU threads, CPU 8-bit output math. |
+| Prompt speed-up | On/off/Auto, prompt card, attention path, split long prompt steps, oversized-prompt protection. |
 | Share with other computers | Donors, split, prompt reading across computers. |
-| Model behaviour | Chat format, RoPE layout, norm convention, thinking. Saved per model file. |
+| Model behaviour | Chat format, system prompt, RoPE layout, norm convention, thinking. Saved per model file. |
 | Conversation memory | Length limit and auto-trim. |
 | Sampling | Temperature, top-p, top-k, min-p, tail-free, penalties, max tokens. |
 | Images | What vision models see and how big uploads are. |
@@ -261,9 +284,9 @@ this is the summary.
 | 8-bit prompt math on card N | **Auto** / On / Off | Rounds activations (never weights) to 8 bits for the card's integer units. ~0.5% per matrix. Auto keeps it only where it's faster. |
 | CPU: 8-bit output math | **Off** / Auto / On | Same idea on the CPU while writing NQ models, ~1% per step. Auto keeps it only if ≥10% faster. |
 | Split long prompt steps | **Auto (AMD only)** / On / Off | Keeps each step under 3 s for AMD's Linux driver time limit. Never below 256 tokens. |
-| Prompt working space on the card | **Fit to what's really free** / By the card's size | How much of the prompt card the prompt speed-up may fill. |
-| Card memory always kept free | **768** MB | Left free on every Maximized card. |
-| Prompt card: memory for reading a prompt | **auto** / MB | With Maximize on the prompt card: room a prompt gets. |
+| GPU prompt processing space | **768** MB | The one card memory number. Every card takes the whole layers that fit in (really free − this). On the prompt card, also the room a prompt gets. |
+| Output matrix (lm_head) | **On the fastest card first** / On a card only if there's room / Keep on the CPU | It's read for every token, so it belongs on a card. *First* gives back just enough layers if no card has room. |
+| Experts on the cards (MoE models) | **Picked by each prompt** / Fixed home / CPU only | Which experts of a mixture-of-experts model get a copy on the cards. |
 | Layers swapped through the card at once | empty | More than 1 can help on cards with lots of memory. |
 | Attention path | **Auto** / Stream / Batch | Short prompts batch. |
 | Store the output layer as Q8_0 | **On** / Off | Faster; tiny rounding change. |
@@ -456,15 +479,20 @@ win.
 |---|---|
 | `--chat-format <fmt>` | `ChatML`, `Qwen3`, `Mistral`, `Mistral V3`, `Llama-3`, `DeepSeek`, `DeepSeek-R1`, `DeepSeek-Coder`, `Phi-3`, `Phi-4`, `Gemma`, `Gemma4`, `Zephyr`, `Alpaca`, `Granite`, `OLMoE`, `Custom`, `Raw` |
 | `--chat-custom-pre-prompt` / `-pre-system` / `-end-system` / `-pre-user` / `-end-user` / `-pre-model` / `-end-model <s>` | The pieces of a `Custom` format |
+| `--system-prompt <text>` | System prompt used whenever a chat sends none (any format; empty = none) |
+| `--system-prompt-file <path>` | The same, read from a file (keeps newlines and quotes; the launcher uses this) |
 
 ### Graphics cards
 
 | Flag | Meaning |
 |---|---|
-| `--gpu-layers <n>` | Layers on the first card |
+| `--gpu-layers <n \| auto>` | Layers on the first card; `auto` = as many as fit (Maximize GPU) |
 | `--gpu-device <n \| name:<card name>[#k]>` | Which card. Names are safer than numbers |
 | `--gpu2-layers <n \| auto>`, `--gpu2-device` | Second card; `auto` = as many as fit |
 | `--gpuN-layers`, `--gpuN-device` (N ≥ 3) | Further cards |
+| `--lm-head <first \| after \| cpu>` | Output matrix: on the fastest card first, giving back layers if needed (default) / on a card only if there's room / on the CPU |
+| `--moe-experts <prompt \| home \| off>` | Mixture-of-experts models: which experts get a copy on the cards (default `prompt`). See [MOE_MODELS.md](MOE_MODELS.md) |
+| `--moe-home <N \| all>` | With `--moe-experts home`: N experts of every layer, or whole layers until the cards are full (default `all`) |
 
 ### Prompt speed-up
 
@@ -479,10 +507,10 @@ win.
 
 | Flag | Meaning |
 |---|---|
-| `--park-layers <N \| auto>` | Maximize on the prompt card: layers live there for writing with no RAM copy |
+| `--park-layers <N \| auto>` | Maximize on the prompt card: layers live there for writing with no RAM copy. Without it, the layers card 1 got from `--gpu-layers` are the ones that move |
 | `--park-below-mb <MB>` | Oversized-prompt protection threshold |
-| `--park-prefill-free-mb <MB \| auto>` | Room the prompt speed-up gets on the prompt card |
-| `--park-keep-mb <MB>` | Kept free on every Maximized card (default 768) |
+| `--park-prefill-free-mb <MB \| auto>` | Room the prompt speed-up gets on the prompt card. The launcher sends the same number as `--park-keep-mb` |
+| `--park-keep-mb <MB>` | GPU prompt processing space: never filled with layers, on every card (default 768). A given number is used exactly |
 | `--park-min-tokens <N>` | Prompts shorter than N never move layers (default 0 = off) |
 
 ### Conversation memory
@@ -556,13 +584,27 @@ controls cover; this table says which control.
 | `NEXUS_MM_NOINT8` | `1` | Never use 8-bit prompt math | — |
 | `NEXUS_PREFILL_TILE_MAX_S` | seconds; `0` = off | Split a prompt step that takes longer than this. Unset = AMD only, 3 s | Split long prompt steps |
 | `NEXUS_PREFILL_TILE_MIN` | tokens (256) | Smallest step size when splitting | — |
-| `NEXUS_TURBO_BUDGET_REAL` | `0` | Size the prompt working space by the card's total memory instead of what's really free | Prompt working space |
+| `NEXUS_TURBO_BUDGET_REAL` | `0` | Size the prompt working space by the card's total memory instead of what's really free | — (the launcher setting was removed in 1.0.1) |
 | `NEXUS_TURBO_GPU_LAYERS` | n | Layers swapped through the card at once | Layers swapped through the card at once |
 | `NEXUS_ATTN_PATH` | `stream` / `batch` | Force the attention path | Attention path |
 | `NEXUS_VK_GFX_QUEUE` | `1` | AMD: use the graphics queue instead of compute (old behaviour) | — |
 | `NEXUS_EVICT_RECENT` | n (24) | How many recently used weights the card's cache never evicts | — |
 | `NEXUS_VULKAN_ALLOW_SOFTWARE` | `1` | Allow a software Vulkan renderer (llvmpipe). Slow; testing only | — |
 | `NEXUS_PREFILL_PROFILE` | `1` | Print a prompt-speed profile | Print prompt-speed profile |
+| `NEXUS_QWEN35_V_ORDER` | `tiled` / `grouped` | Override the detected value-head order of a Qwen 3.5 / 3.6 file (llama.cpp GGUFs are tiled, Nexus files grouped) | — |
+| `NEXUS_BF16_WIDEN` | `0` | Don't widen BF16 weights for the card (they then run on the CPU) | — |
+
+### Mixture-of-experts models
+
+| Variable | Values | Effect | Launcher control |
+|---|---|---|---|
+| `NEXUS_MOE_EXPERTS` | `prompt` / `home` / `off` | Same as `--moe-experts` (the flag wins) | Experts on the cards |
+| `NEXUS_MOE_HOME` | n / `all` | Same as `--moe-home` | Home experts per layer |
+| `NEXUS_MOE_STREAM_MIN` | tokens (24) | While reading a prompt: an expert picked by at least this many tokens is streamed through the prompt card instead of run on the CPU | — |
+| `NEXUS_MOE_RECHECK` | tokens (256) | *Picked by each prompt*: written tokens between re-checks | — |
+| `NEXUS_MOE_BATCH` | `0` | Read MoE prompts one token at a time (1.0.0 behaviour) | — |
+| `NEXUS_MOE_ATTN_GPU` | `0` | MoE attention on the CPU (1.0.0 behaviour) | — |
+| `NEXUS_MOE_GPU_EXPERTS` | `1` | The old per-matrix card path for experts (slow; off) | — |
 
 ### Writing (output)
 
@@ -570,6 +612,8 @@ controls cover; this table says which control.
 |---|---|---|---|
 | `NEXUS_CPU_INT8` | `1` / `auto` / unset | CPU 8-bit output math for NQ models | CPU: 8-bit output math |
 | `NEXUS_LMHEAD_Q8` | `0` | Keep the output layer exact instead of Q8_0 | Speed and accuracy |
+| `NEXUS_LMHEAD_MODE` | `first` / `after` / `cpu` | Same as `--lm-head` | Output matrix (lm_head) |
+| `NEXUS_LMHEAD_CPU` | `1` | Keep the output matrix on the CPU | — |
 | `NEXUS_DECODE_INT8` | `0` | Exact math for K-quant matrices while writing | Speed and accuracy |
 
 ### Memory and safety
@@ -776,7 +820,13 @@ words. The lines worth knowing:
 | `[prefill] layer N: a ...-token slice took ... s ...` | *Split long prompt steps* kicked in |
 | `[park] ...` | Maximize GPU / protection moving layers |
 | `[nexus] graphics card ... is nearly full while writing ...` | A card gave a layer back to the CPU |
-| `[vulkan] cache full and nothing it can evict ...` | A card is completely full: raise *Card memory always kept free* |
+| `[nexus] how fast each card reads weights while writing: ...` | Each card's measured read speed; the output matrix and MoE experts go fastest first |
+| `[decode] where each layer was written ...` | Once per run: which card computed each layer range while writing, and why the CPU took any |
+| `[decode] time per written token (avg of 8): ...` | Once, after the 10th token: layers vs output matrix time, tokens/s |
+| `[nexus] Qwen 3.5 value heads: ...` / `llama.cpp Qwen 3.5: ...` | How a Qwen 3.5 / 3.6 GGUF's merged tensors and head order were read |
+| `[chat] System prompt ...` | Which system prompt is in use when a chat sends none |
+| `[moe] ...` / `[moe:prompt] ...` | Mixture-of-experts: experts on the cards, prompt-picked moves, prompt split (see MOE_MODELS.md) |
+| `[vulkan] cache full and nothing it can evict ...` | A card is completely full: raise *GPU prompt processing space* |
 | `[mtp-time] step=… propose=…ms verifyN(ntok=…)=…ms` | MTP timing per step |
 | `[mtp-diag] … MATCH / miss` | Which drafts were kept |
 | `[ctx] ...` | Conversation limit, auto-trim, memory full |
@@ -807,6 +857,7 @@ problem.
 |---|---|
 | Gibberish right after loading | Model behaviour → try the other RoPE layout or norm convention. The log says which was used. |
 | Odd turn markers or the model talks to itself | Wrong chat format. Pick it by hand in Model behaviour. |
+| The model says it's someone it isn't (e.g. "Qwen, by Alibaba") | Set your own *System prompt* in Model behaviour. Since 1.0.1, that Qwen line is only used for models named Qwen. |
 | Reply stops with *Memory full* | Raise the limit or turn auto-trim on (Conversation memory). |
 | Reply stops with a memory safety message | RAM is nearly gone. Free memory, shorten the conversation, put more layers on cards, or use Maximize / protection. |
 | The model "feels" something you made it forget | Recurrent models (Qwen3.5/3.6) keep a faint trace in their linear-attention layers. Start a new chat for a clean slate. |
@@ -818,7 +869,8 @@ problem.
 | Prompts slower after adding a card | PCIe split to x8. Move the helper card to a chipset slot (often x4 is fine for it) or use a riser. |
 | Prompts slow on an NVIDIA card | Its 8-bit prompt math isn't Off? Check the `[vulkan] 8-bit prompt math` line. |
 | Prompts slow on an old AMD card | Expected with 8-bit forced On; set it to Auto. |
-| Writing slow | More layers on cards; threads = physical cores; try CPU 8-bit output on Auto; MTP off on CPU-heavy splits. |
+| Writing slow | Read the `[decode]` placement line: it names any layers the CPU computed and why. Then: more layers on cards; threads = physical cores; try CPU 8-bit output on Auto; MTP off on CPU-heavy splits. |
+| MoE model writes slowly | Check the `[moe] prompt-picked ... now N% would be` line: the higher, the better. See [MOE_MODELS.md](MOE_MODELS.md#troubleshooting). |
 | MTP slower than without | Most layers are on the CPU. Try 2 drafts, or turn it off. |
 | The computer freezes during long prompts | Memory safety buffer on; on Linux, Maximize GPU or oversized-prompt protection. |
 
@@ -827,7 +879,7 @@ problem.
 | Symptom | Fix |
 |---|---|
 | A helper card stays empty | Look for its `[nexus] graphics card N` line at load. If it says it doesn't fit, lower its layers or use Maximize. |
-| Out-of-memory messages | *Card memory always kept free* → 1024; *Prompt working space* → really free. More if the desktop runs on that card. |
+| Out-of-memory messages | *GPU prompt processing space* → 1024. More if the desktop runs on that card. |
 | AMD card resets during a long prompt ("context is lost") | *Split long prompt steps* → On. |
 | A card is missing from the list | *This computer* → *Re-check hardware*; check its Vulkan driver (`vulkaninfo --summary`). |
 | Integrated graphics gives wrong answers | It's off by default for that reason. Use the CPU or a discrete card. |
@@ -854,6 +906,8 @@ with *Log detail* at 2.
 | **Decode** | Writing the reply, one token at a time; limited by memory speed. |
 | **Prompt card** | The graphics card the prompt speed-up streams layers through. |
 | **Helper card** | Any other card. Holds layers for writing. |
+| **Output matrix (lm_head)** | The last weight of the model, which turns the final layer's result into word scores. Read for every token. |
+| **Mixture of experts (MoE)** | A model whose layers hold many small *experts*, of which each token uses a few. See MOE_MODELS.md. |
 | **KV cache** | The model's working memory of the conversation. Grows with every token. |
 | **Context / limit** | How many tokens are in memory, and how many are allowed. |
 | **Quantization** | Storing weights in fewer bits (4, 5, 6, 8) to save memory. |

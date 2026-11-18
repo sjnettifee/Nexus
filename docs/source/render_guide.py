@@ -56,7 +56,7 @@ cover = """
   <div class="sub">How Nexus works, setups for the hardware you have, every launcher setting,
   every server flag and environment variable, every HTTP endpoint, the log, and what to do when
   something goes wrong.</div>
-</div><div class="foot">FREE &middot; LOCAL &middot; AGPLv3 &middot; github.com/sjnettifee/nexus</div></div>
+</div><div class="foot">VERSION 1.0.1 &middot; FREE &middot; LOCAL &middot; AGPLv3 &middot; github.com/sjnettifee/nexus</div></div>
 """
 
 doc = f"<!doctype html><html><head><meta charset='utf-8'><title>The Nexus Guide</title><style>{css}</style></head><body>{cover}{html_body}</body></html>"
