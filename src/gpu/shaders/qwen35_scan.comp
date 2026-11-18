@@ -72,15 +72,18 @@ void main() {
     uint hd = pc.hd;
     if (hd == 0u || hd > 256u || pc.repeat == 0u) return;
 
-    uint hk = hv / pc.repeat;
-    uint rr = hv - hk * pc.repeat;
+    // pc.grouped: 0 = flat [Q][K][V], value heads grouped by key head (HF / .nxm order) -> key head = hv / repeat
+    //             1 = grouped-span conv layout (old Qwen3-Next GGUF)
+    //             2 = flat, value heads TILED (llama.cpp Qwen 3.5 GGUF: k0v0 k1v0 .. k0v1 k1v1 ..) -> key head = hv mod kh
+    uint hk = (pc.grouped == 2u) ? (hv % pc.kh) : (hv / pc.repeat);
+    uint rr = (pc.grouped == 2u) ? (hv / pc.kh) : (hv - hk * pc.repeat);
 
     for (uint t = 0u; t < pc.n_tokens; ++t) {
         uint qoff;
         uint koff;
         uint voff;
 
-        if (pc.grouped != 0u) {
+        if (pc.grouped == 1u) {
             uint group_span = 2u * hd + pc.repeat * hd;
             uint base = t * pc.conv_dim + hk * group_span;
             qoff = base;

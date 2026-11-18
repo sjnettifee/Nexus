@@ -53,6 +53,7 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <cctype>
 #include <iomanip>
@@ -5984,7 +5985,13 @@ static void usage(const char* p){
         "\n  --park-layers <N|auto>     Maximize GPU: N layers (auto = as many as fit) live on the prompt speed-up card for writing, with no copy in RAM; when a prompt needs the card's room they move off it, then go back before the reply (needs --turbo-prefill, Linux)"
         "\n  --park-below-mb <MB>       oversized-prompt protection: while a prompt is read, whenever free RAM is under this, drop layers from RAM; they go onto the card for writing (needs --turbo-prefill, Linux)"
         "\n  --park-prefill-free-mb <MB|auto> card memory the prompt speed-up gets while a prompt is read (default auto = what it needs)"
-        "\n  --park-keep-mb <MB>        card memory always left free when putting layers on it (default 768); also what --gpu2-layers auto / --gpuN-layers auto leave free"
+        "\n  --system-prompt <text>     the system prompt used whenever a chat sends none (every chat format). \"\" = no system prompt at all. Without it: the format's usual one (Qwen's own line only for models named Qwen)"
+        "\n  --system-prompt-file <p>   the same, read from a file (any length, newlines kept) -- what the launcher uses"
+        "\n  --moe-experts prompt|home|off  mixture-of-experts models only: which experts get a copy on the cards (the rest run on the CPU, at the same time). prompt (default): after each prompt is read, the experts it used most move onto the cards; re-checked while writing. home: a fixed set placed at load and kept (see --moe-home). off: experts on the CPU only. The attention part of every layer runs on its card in all three"
+        "\n  --moe-home N|all  with --moe-experts home: N experts of every layer, or all (default) = every expert of as many layers as fit"
+        "\n  --lm-head first|after|cpu  where the output matrix (lm_head, read in full every token) goes. first (default): the fastest card that has room -- measured, not guessed -- and if no card has room, the fastest card hands back its last layers to make room for it. after: only a card with room left after the layers; never moves a layer. cpu: stays on the CPU"
+        "\n  --park-keep-mb <MB>        GPU prompt processing space: card memory never filled with layers, kept free for reading prompts and writing (default 768). Every card obeys it: layers that fit = (free on the card - this), whole layers only, for --gpu-layers auto, --gpu2-layers auto, --gpuN-layers auto and --park-layers"
+        "\n  --gpu-layers <N|auto>      layers on the first card (auto = as many as fit)"
         "\n  --gpu2-layers <N|auto>     layers on the second card (auto = as many as fit); --gpu3-layers, --gpu4-layers, ... the same for more cards"
         "\n  --park-min-tokens <N>      optional: prompts shorter than N never move layers and are read on the CPU (default 0 = no such rule)"
         "\n  --ctx-limit <n|auto|max>  conversation length limit: max = the model's maximum (default); n = that many tokens, even above the model's maximum; auto = no limit at all, grows until memory runs out"
@@ -6101,7 +6108,10 @@ int main(int argc,char* argv[]){
     int trace_level_cli = -1;
     bool turbo_prefill_cli = false;
     // Layer parking: "Maximize GPU" (--park-layers) and oversized-prompt protection (--park-below-mb). See park_setup.
+    bool park_keep_given = false;
     int park_layers_cli = 0, park_below_mb_cli = 0, park_keep_mb_cli = 768, park_prefill_free_mb_cli = 0, park_min_tokens_cli = 0;
+    std::string system_prompt_cli; bool system_prompt_set = false;     // --system-prompt / --system-prompt-file
+    int moe_mode_cli = -1, moe_home_cli = -2;                          // --moe-experts / --moe-home (MoE models only)
     bool turbo_gpu_stream_cli = false;       // NEW
     bool prefill_token_by_token_cli = false;
     int  turbo_vram_budget_mb_cli = 0;       // NEW
@@ -6121,7 +6131,7 @@ int main(int argc,char* argv[]){
         else if(a=="--chat-custom-end-user"&&i+1<argc){ custom_chat_template.end_user=argv[++i]; custom_chat_template_set=true; }
         else if(a=="--chat-custom-pre-model"&&i+1<argc){ custom_chat_template.pre_model=argv[++i]; custom_chat_template_set=true; }
         else if(a=="--chat-custom-end-model"&&i+1<argc){ custom_chat_template.end_model=argv[++i]; custom_chat_template_set=true; }        
-        else if(a=="--gpu-layers"&&i+1<argc)gpu_layers_cli=atoi(argv[++i]);
+        else if(a=="--gpu-layers"&&i+1<argc){ std::string v=argv[++i]; gpu_layers_cli = (v=="auto"||v=="max") ? -2 : atoi(v.c_str()); }   // -2 = as many as fit
         else if(a=="--gpu-device"&&i+1<argc)gpu_device_cli=nx_resolve_gpu_arg(argv[++i]);
         else if(a=="--gpu2-layers"&&i+1<argc){ std::string v=argv[++i]; gpu2_layers_cli = (v=="auto"||v=="max") ? -2 : std::max(0, atoi(v.c_str())); }   // -2 = auto (-1 = not given)
         else if(a.size()>14&&a.compare(0,5,"--gpu")==0&&isdigit((unsigned char)a[5])&&i+1<argc
@@ -6167,7 +6177,35 @@ int main(int argc,char* argv[]){
         else if(a=="--turbo-prefill") turbo_prefill_cli = true;
         else if(a=="--park-layers"&&i+1<argc){ std::string v=argv[++i]; park_layers_cli = (v=="auto"||v=="max") ? -1 : std::max(0, atoi(v.c_str())); }
         else if(a=="--park-below-mb"&&i+1<argc) park_below_mb_cli = std::max(0, atoi(argv[++i]));
-        else if(a=="--park-keep-mb"&&i+1<argc) park_keep_mb_cli = std::max(0, atoi(argv[++i]));
+        else if(a=="--park-keep-mb"&&i+1<argc){ park_keep_mb_cli = std::max(0, atoi(argv[++i])); park_keep_given = true; }
+        else if(a=="--system-prompt"&&i+1<argc){ system_prompt_cli = argv[++i]; system_prompt_set = true; }
+        else if(a=="--system-prompt-file"&&i+1<argc){   // the launcher writes it to a file: any length, any characters, newlines kept
+            const std::string path = argv[++i];
+            std::ifstream f(path, std::ios::binary);
+            if (f) { system_prompt_cli.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); system_prompt_set = true;
+                     while (!system_prompt_cli.empty() && (system_prompt_cli.back() == '\n' || system_prompt_cli.back() == '\r')) system_prompt_cli.pop_back(); }
+            else fprintf(stderr, "[server] --system-prompt-file %s: could not read it -- using the model's usual system prompt\n", path.c_str());
+        }
+        else if(a=="--lm-head"&&i+1<argc){       // where the output matrix goes: first (default) / after / cpu -- read by the engine at its first token
+            const std::string v = argv[++i];
+            if (v == "first" || v == "after" || v == "cpu") {
+#ifdef _WIN32
+                _putenv_s("NEXUS_LMHEAD_MODE", v.c_str());
+#else
+                setenv("NEXUS_LMHEAD_MODE", v.c_str(), 1);
+#endif
+            }
+            else fprintf(stderr, "[nexus] --lm-head %s: expected first, after or cpu -- keeping first\n", v.c_str());
+        }
+        else if(a=="--moe-experts"&&i+1<argc){   // which experts of a MoE model get a copy on the cards
+            const std::string v = argv[++i];
+            if (v == "off") moe_mode_cli = 0; else if (v == "home") moe_mode_cli = 1; else if (v == "prompt") moe_mode_cli = 2;
+            else fprintf(stderr, "[nexus] --moe-experts %s: expected prompt, home or off -- keeping prompt\n", v.c_str());
+        }
+        else if(a=="--moe-home"&&i+1<argc){      // home mode: experts per layer, or "all" = every expert of as many layers as fit
+            const std::string v = argv[++i];
+            moe_home_cli = (v == "all") ? -1 : std::max(0, atoi(v.c_str()));
+        }
         else if(a=="--park-prefill-free-mb"&&i+1<argc){ std::string v=argv[++i]; park_prefill_free_mb_cli = v=="auto" ? 0 : std::max(0, atoi(v.c_str())); }
         else if(a=="--park-min-tokens"&&i+1<argc) park_min_tokens_cli = std::max(0, atoi(argv[++i]));
         else if(a=="--turbo-gpu-stream") turbo_gpu_stream_cli = true;                              // NEW
@@ -6402,7 +6440,7 @@ int main(int argc,char* argv[]){
             fprintf(stderr,"[server] WARNING: LoRA load failed\n");
     }
     // CLI --gpu-layers overrides nexus.json value
-    if(gpu_layers_cli>=0) S.n_gpu_layers=gpu_layers_cli;
+    if(gpu_layers_cli>=0 || gpu_layers_cli==-2) S.n_gpu_layers=gpu_layers_cli;
 
     printf("\n  ----------------------------------------\n");
     printf("  -   NEXUS  -  Open Inference Engine   -\n");
@@ -6418,17 +6456,17 @@ int main(int argc,char* argv[]){
 
     // Parking needs every big layer weight mapped in place from the model file (so a layer's RAM copy can be thrown
     // away and read back from the file); the loader does that when NEXUS_DIRECT_GPU_LAYERS covers every layer.
-    const bool park_wanted = (park_layers_cli != 0 || park_below_mb_cli > 0) && dist_peers.empty();
+    // A plain layer count counts too: with the prompt speed-up on, those layers leave the card while a prompt is read
+    // and come back for the reply, exactly as Maximize GPU's do.  With the prompt speed-up OFF nothing ever leaves the
+    // card -- the layers are loaded and stay put, however many were asked for.
+    const bool park_wanted = (park_layers_cli != 0 || park_below_mb_cli > 0 || gpu_layers_cli > 0 || gpu_layers_cli == -2) && dist_peers.empty();
 #ifndef _WIN32
     if (park_wanted && turbo_prefill_cli && !prefill_token_by_token_cli) {
         setenv("NEXUS_DIRECT_GPU_LAYERS", "1000000", 1);
         unsetenv("NEXUS_DIRECT_VRAM_MB");
-        if (gpu_layers_cli > 0)
-            fprintf(stderr, "[park] note: %d layers were also asked to live on the card the usual way; Maximize GPU replaces that "
-                            "(use --gpu-layers 0 with --park-layers)\n", gpu_layers_cli);
     }
 #endif
-    if (park_wanted && !turbo_prefill_cli)
+    if (park_wanted && !turbo_prefill_cli && (park_layers_cli != 0 || park_below_mb_cli > 0))
         fprintf(stderr, "[park] Maximize GPU / oversized-prompt protection need the prompt speed-up (--turbo-prefill) on a card: ignored\n");
 
     auto lcb=[](const nexus::LoadProgress& p){
@@ -6523,10 +6561,13 @@ int main(int argc,char* argv[]){
         S.engine.override_chat_format(chat_format_override);
         fprintf(stderr,"[server] Chat format override: %s\n",chat_format_override.c_str());
     }
+    if (system_prompt_set) S.engine.set_system_prompt(system_prompt_cli);   // after the format: it holds for whichever format is used
+    if (moe_mode_cli >= 0 || moe_home_cli != -2) S.engine.set_moe_experts(moe_mode_cli, moe_home_cli);   // used at the first token
 
     // Apply GPU layer offloading (after model is loaded, before serving)
     int actual_gpu_layers = 0;
-    if(S.n_gpu_layers > 0){
+    S.engine.set_card_fill_keep_mb(park_keep_given ? park_keep_mb_cli : 0);   // 0 = worked out from each card
+    if(S.n_gpu_layers > 0 || S.n_gpu_layers == -2){
         if(gpu_device_cli >= 0)
             S.engine.set_gpu_device(gpu_device_cli);
         actual_gpu_layers = S.engine.set_gpu_layers(S.n_gpu_layers);
@@ -6536,7 +6577,6 @@ int main(int argc,char* argv[]){
 
     // Secondary GPU (iGPU / second device) - layers after the primary GPU's share
     int actual_gpu2_layers = 0;
-    S.engine.set_card_fill_keep_mb(park_keep_mb_cli);              // what "Maximize" leaves free on cards 2, 3, ...
     if((gpu2_layers_cli > 0 || gpu2_layers_cli == -2) && gpu2_device_cli >= 0){
         actual_gpu2_layers = S.engine.set_gpu2_layers(gpu2_layers_cli == -2 ? -1 : gpu2_layers_cli, gpu2_device_cli,
                                                        actual_gpu_layers);
@@ -6620,11 +6660,14 @@ int main(int argc,char* argv[]){
     }
 
     if (park_wanted && turbo_prefill_cli && !prefill_token_by_token_cli) {
-        if (gpu_layers_cli > 0)
-            fprintf(stderr, "[park] OFF: layers already live on the card the usual way (--gpu-layers %d); set it to 0 to use Maximize GPU\n", gpu_layers_cli);
-        else {
+        // --park-layers wins when it was given; otherwise the layer count that actually went on card 1 is what moves
+        // off while a prompt is read and comes back for the reply.  (-1 = Maximize GPU: as many as fit.)
+        const int park_n = (park_layers_cli != 0) ? park_layers_cli : actual_gpu_layers;
+        if (park_n != 0) {
+            if (park_layers_cli == 0)
+                fprintf(stderr, "[park] the %d layers on card 1 move off while a prompt is read and come back for the reply\n", park_n);
             S.engine.set_mtp_card_reserve(S.mtp_enabled && S.mtp_gpu);
-            S.engine.park_setup(park_layers_cli, park_below_mb_cli, park_keep_mb_cli, park_prefill_free_mb_cli, park_min_tokens_cli);
+            S.engine.park_setup(park_n, park_below_mb_cli, park_keep_mb_cli, park_prefill_free_mb_cli, park_min_tokens_cli);
         }
     }
 

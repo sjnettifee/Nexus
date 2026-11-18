@@ -426,6 +426,26 @@ inline int nx_direct_vram_layer_limit(const TensorMap& tensors) {
 }
 // Turn the in-place (file-backed) weights of layers >= first_layer into ordinary RAM copies.  Used for layers that did
 // not fit on the card and so run on the CPU: each page is touched once (copy-on-write); pointers stay valid.
+// Same, but only for the layers marked in `want` (true = this layer is on no graphics card).  With two cards the
+// "from this layer on" form copied every layer meant for the SECOND card into RAM first, because it ran before that
+// card was filled -- the layers were then uploaded to card 2 anyway, so the copy was pure waste of time and RAM.
+inline void nx_pin_direct_layers_if(const std::vector<uint8_t>& want) {
+#ifndef _WIN32
+    size_t bytes = 0; int tensors = 0;
+    for (auto& r : nx_direct_ranges()) {
+        if (r.layer < 0 || (size_t)r.layer >= want.size() || !want[(size_t)r.layer]) continue;
+        const uintptr_t b = (uintptr_t)r.p, e = b + r.n;
+        for (uintptr_t a = b & ~(uintptr_t)4095; a < e; a += 4096) {
+            volatile uint8_t* q = (volatile uint8_t*)(a < b ? b : a);
+            *q = *q;
+        }
+        bytes += r.n; ++tensors; r.layer = -2;
+    }
+    if (tensors) { fprintf(stderr, "[load] %d weight tensors (%zu MB) belong to layers that stay on the CPU -> copied into RAM\n", tensors, bytes >> 20); fflush(stderr); }
+#else
+    (void)want;
+#endif
+}
 inline void nx_pin_direct_layers_from(int first_layer) {
 #ifndef _WIN32
     size_t bytes = 0; int tensors = 0;

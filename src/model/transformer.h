@@ -42,6 +42,7 @@
 #include <functional>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include "../core/memguard.h"
 #include <atomic>
 #include <cctype>
@@ -890,8 +891,11 @@ inline bool nx_lm_head_gpu_ok(QuantType t) {
     static const bool force_cpu = (std::getenv("NEXUS_LMHEAD_CPU") != nullptr);
     static const bool force_gpu = (std::getenv("NEXUS_LMHEAD_GPU") != nullptr);
     if (force_cpu) return false;
-    if (force_gpu) return true;
-    return t == QuantType::NQ4_G64;
+    (void)force_gpu;
+    // NQ4/5/6/8 all on the card: checked against the CPU at full Qwen 3.5 size (248070 x 4096) -- NQ4 4.6e-05,
+    // NQ5 8.2e-05, NQ6 2.1e-04, NQ8 7.0e-04 max difference, same argmax every time. Only NQ4 used to be let through,
+    // which is why a Q4 .nxm (NQ5 output matrix) kept its lm_head on the CPU. NEXUS_LMHEAD_CPU=1 still keeps it there.
+    return true;
 }
 
 inline void nx_apply_rope_qwen35_partial_or_full(float* x,
@@ -1228,9 +1232,52 @@ public:
     int set_gpu2_layers(int n, int device_index, int first_layer);
     // 3rd, 4th, 5th ... graphics card: layers [first_layer, first_layer+n). Each call adds one more card.
     int add_gpu_layers(int n, int device_index, int first_layer);
+    // Call once after every card has been given its layers: the layers left on the CPU get their RAM copy, and
+    // nothing else does.  The first forward pass calls it if the caller forgot.
+    void finish_gpu_setup() {
+        if (gpu_setup_done_) return;
+        gpu_setup_done_ = true;
+#ifdef NEXUS_VULKAN
+        // Layers meant for the first card that did not fit in its memory and that no other card took either: they can
+        // still be computed on that card, reading their weights straight out of system RAM (no extra copy), which beats
+        // the CPU.  This waits until here so a card with room in its own memory gets them first.
+        if (host_pending_first_ >= 0) {
+            gpu::VulkanBackend& g = gpu::gpu();
+            if (g.ready() && g.host_import_available()) {
+                int n = 0, first = -1, last = -1;
+                g.set_host_only_weights(true);
+                for (int l = host_pending_first_; l < host_pending_last_ && l < (int)layer_weights_.size(); ++l) {
+                    auto& lw = layer_weights_[l];
+                    if (lw.gpu_layer || lw.gpu2_layer || lw.gpux >= 0) continue;
+                    if (!eager_upload_layer_weights(l, g)) break;
+                    lw.gpu_layer = true; ++n; last = l; if (first < 0) first = l;
+                }
+                g.set_host_only_weights(false);
+                if (n) {
+                    n_gpu_layers_ = std::max(n_gpu_layers_, last + 1);
+                    g.set_gpu_layers(n_gpu_layers_);
+                    fprintf(stderr, "[nexus] Placement: layers %d-%d computed on %s but read from system RAM "
+                                    "(no extra copy, runs at RAM speed)\n", first, last, g.info().device_name.c_str());
+                    fflush(stderr);
+                }
+            }
+            host_pending_first_ = host_pending_last_ = -1;
+        }
+#endif
+        place_lm_head_on_a_card();
+        moe_place();                                   // experts get what the layers and the lm_head left (a no-op for other models)
+        report_cards("once every card has had its layers");
+        std::vector<uint8_t> cpu_only(layer_weights_.size(), 0);
+        for (size_t l = 0; l < layer_weights_.size(); ++l) {
+            const auto& lw = layer_weights_[l];
+            cpu_only[l] = (uint8_t)!(lw.gpu_layer || lw.gpu2_layer || lw.gpux >= 0);
+        }
+        moe_keep_experts_in_ram();
+        gguf::nx_pin_direct_layers_if(cpu_only);
+    }
     // n < 0 for set_gpu2_layers / add_gpu_layers = "Maximize": as many layers as fit on that card, measured from what
     // the card really has free (when the driver reports it), keeping this much free (default 512 MB).
-    void set_card_fill_keep_mb(int mb) { card_fill_keep_bytes_ = (size_t)std::max(64, mb) << 20; }
+    void set_card_fill_keep_mb(int mb) { card_fill_keep_bytes_ = mb > 0 ? ((size_t)std::max(64, mb) << 20) : 0; }   // 0 = work it out per card
     // MTP drafting on the graphics card runs on the prompt card and puts its weights there the first time it drafts --
     // after Maximize GPU has filled the card. With this on, Maximize leaves that much room for it.
     void set_mtp_card_reserve(bool on) { mtp_card_reserve_ = on; }
@@ -1345,8 +1392,21 @@ private:
     // every layer to GPU and lets the bounded weight cache stream them
     // in/out of VRAM. Decode falls back to whatever set_gpu_layers() chose.
     bool turbo_gpu_stream_ = false;
-    size_t card_fill_keep_bytes_ = 768ull << 20;
+    size_t card_fill_keep_bytes_ = 0;         // 0 = card_keep_bytes() works it out; --park-keep-mb sets it
+    // THE processing buffer: what stays free on a card once its layers are on it, for the work of running them
+    // (the prompt's working space, the writing buffers, the conversation mirror).  One number for the whole engine:
+    // the layer fill, Maximize GPU's packing and the prompt speed-up's budget all leave exactly this much.
+    // --park-keep-mb sets it and is obeyed exactly: room for layers = what the card really has free, minus this.
+    // Without it, 768 MB, and then never more than a third of a small card (a guess must not swallow the whole card).
+    static constexpr size_t kCardKeepDefault = 768ull << 20;
+    size_t card_keep_bytes(size_t free_bytes) const {
+        if (card_fill_keep_bytes_) return card_fill_keep_bytes_;        // asked for: exactly that, no second-guessing
+        return std::min<size_t>(kCardKeepDefault, std::max<size_t>(free_bytes / 3, 64ull << 20));
+    }
     int layers_that_fit(gpu::VulkanBackend& b, int first_layer, const char* card_name);
+    bool gpu_setup_done_ = true;              // false after set_gpu_layers until finish_gpu_setup() has run
+    int host_pending_first_ = -1, host_pending_last_ = -1;   // layers the first card had no memory for
+    std::vector<std::vector<const void*>> primary_card_w_;   // what a layer count put on the first card
     // Layer parking (see park_setup)
     struct ParkRange { uint8_t* p; size_t n; };
     bool park_on_ = false;
@@ -1366,6 +1426,9 @@ private:
     long long park_ram_floor() const;                   // free RAM to keep: threshold (or 512 MB) + room for the reply's KV
     bool park_relieve_exhausted_ = false;
     std::atomic<int> park_mv_done_{0}, park_mv_total_{0};
+    // One line per card saying what its memory is actually holding, so nobody has to guess which of the four
+    // things (layers / prompt working space / conversation memory / kept free) filled it up.
+    void report_cards(const char* when) const;
     bool park_on_card(int l) const { return park_on_ && l >= 0 && l < (int)park_state_.size() && park_state_[l] == 2; }
     // Layers placed on the prompt speed-up card ("GPU layers" on the first card) live there for writing AND reading:
     // the prompt is read through them in place and they are never pushed out by the layers streaming past.
@@ -1397,6 +1460,13 @@ private:
     std::unordered_map<const void*, std::vector<uint8_t>> q8swap_;
     size_t q8swap_bytes_ = 0;
     inline void q8swap(const void*& w, QuantType& t, size_t rows, size_t cols);
+    // The card has no BF16 kernel. One BF16 weight in a layer used to send the WHOLE layer back to the CPU, and on
+    // Qwen 3.5 that is exactly what happened: ssm_alpha and ssm_beta are stored BF16 (32x4096, 256 KB each), so all
+    // 24 linear-attention layers were written by the processor while their weights sat on the cards. Widen those to
+    // F32 once -- BF16 to F32 is exact, it is the top half of the float -- and the card runs the layer.
+    std::unordered_map<const void*, std::vector<float>> bf16wide_;
+    size_t bf16wide_bytes_ = 0;
+    inline void bf16widen(const void*& w, QuantType& t, size_t rows, size_t cols);
     std::vector<uint8_t> lm_head_q8_;   // lm_head re-encoded as Q8_0 for decode speed (lm_head_weight/type point here when active)
     bool zero_centered_norm_ = false; // Qwen3-Next style RMSNorm: weight means (1 + weight)
 
@@ -1455,6 +1525,79 @@ private:
         if (!lw.gpu2_layer) return false;
         gpu::VulkanBackend* b = backend2_for(lw); return b && b->ready();
     }
+    // Every card that is up: card 1, card 2, card 3 ... in that order.
+    std::vector<gpu::VulkanBackend*> all_cards() const {
+        std::vector<gpu::VulkanBackend*> v;
+#ifdef NEXUS_VULKAN
+        if (gpu::gpu().ready()) v.push_back(&gpu::gpu());
+        if (gpu2_ && gpu2_->ready()) v.push_back(gpu2_.get());
+        for (const auto& b : gpux_) if (b && b->ready()) v.push_back(b.get());
+#endif
+        return v;
+    }
+    // The card the lm_head (output matrix) lives on; nullptr = the CPU.  Not necessarily card 1: with the layers split
+    // over two cards it goes wherever there is room for it.
+    gpu::VulkanBackend* lm_card_ = nullptr;
+    gpu::VulkanBackend& lm_card() { return lm_card_ ? *lm_card_ : gpu::gpu(); }
+    void place_lm_head_on_a_card();
+
+    // ---- Mixture-of-experts layers on the cards ----------------------------------------------------------------------------
+    // The attention half of a MoE layer runs on its card like any layer. The experts are the bulk of the model (~95% of a
+    // 35B-A3B) and only a few are used per token, so they live in RAM and SOME of them also get a copy on a card:
+    //   home   (mode 1): a fixed set, placed once at load -- N experts of every layer, or (N = -1) every expert of as many
+    //                    layers as fit. They stay there.
+    //   prompt (mode 2): after each prompt is read, the experts that prompt actually used are moved onto the cards (the most
+    //                    used first) and the ones it did not use make room; re-checked every so often while writing.
+    //   off    (mode 0): experts on the CPU only (the old behaviour, minus its slow per-matrix card round trips).
+    // A token's experts then run where they are: each card does its share in ONE submit while the CPU does the rest.
+    // The shared expert (used by every token) goes on first in every mode.
+public:
+    void set_moe_experts(int mode, int home_n) { moe_mode_ = mode; moe_home_n_ = home_n; }
+private:
+    int  moe_mode_ = -1;                     // -1: not set (NEXUS_MOE_EXPERTS, else prompt)
+    int  moe_home_n_ = -2;                   // -2: not set (NEXUS_MOE_HOME, else -1 = whole layers)
+    bool moe_placed_ = false, moe_due_ = false;
+    int  moe_since_ = 0;                     // tokens through the layers since the last prompt-picked check
+    std::vector<gpu::VulkanBackend*> moe_cards_;
+    std::vector<size_t> moe_cap_, moe_held_; // per card: bytes allowed for experts / held now
+    std::vector<std::vector<int8_t>> moe_res_;   // [layer][expert; last = shared] -> index in moe_cards_, -1 = RAM only
+    std::vector<uint8_t> moe_layer_on_card_;     // [layer] at least one expert on a card
+    std::vector<std::vector<float>> moe_use_;    // [layer][expert] how often it was picked since the last check
+    unsigned long long moe_runs_card_ = 0, moe_runs_all_ = 0;
+    int  moe_park_ci_ = -1;                      // the parking card's index in moe_cards_ (its experts step aside for each prompt)
+    std::vector<std::pair<int, int>> moe_aside_; // experts taken off the parking card for a prompt, to come back after it
+    void moe_clear_card(int ci);
+    int  moe_mode_now();
+    int  moe_home_now();
+    bool moe_attn_on_card() const {
+        static const bool off = [] { const char* e = std::getenv("NEXUS_MOE_ATTN_GPU"); return e && e[0] == '0'; }();
+        return !off;
+    }
+    bool moe_expert_job(const TransformerLayerWeights& lw, int e, gpu::VulkanBackend::MoeJob& j) const;
+    size_t moe_job_bytes(gpu::VulkanBackend& c, const gpu::VulkanBackend::MoeJob& j) const;
+    bool moe_in_experts(const TransformerLayerWeights& lw, const void* p) const;
+    void moe_keep_experts_in_ram();
+    bool moe_load(int l, int e, int ci);
+    void moe_unload(int l, int e);
+    void moe_place();
+    void moe_rebalance(const char* why);
+    void moe_route_one(const TransformerLayerWeights& lw, const float* logits, int* idx, float* w) const;
+    bool forward_moe_ffn_batch(const TransformerLayerWeights& lw, const float* xb, float* out, int layer_idx, int n);
+    // a MoE layer can take the batched prompt path when its experts are in a layout forward_moe_ffn_batch does
+    bool moe_batch_ok(const TransformerLayerWeights& lw) const {
+        static const bool off = [] { const char* e = std::getenv("NEXUS_MOE_BATCH"); return e && e[0] == '0'; }();
+        gpu::VulkanBackend::MoeJob j{};
+        return !off && lw.moe && lw.moe_router && moe_expert_job(lw, 0, j) &&
+               (!lw.moe_has_shared || !lw.wgate_shexp || moe_expert_job(lw, (int)lw.moe_expert_count, j));
+    }
+    std::vector<std::pair<const gpu::VulkanBackend*, double>> card_gbps_;   // measured once per card
+    double card_read_gbps(gpu::VulkanBackend& c);
+    // The lm_head in pieces a card can bind: one piece when it fits the card's buffer limit (4 GB on most discrete
+    // cards), several when it doesn't (some cards stop at 128 MB - 2 GB). Each piece is a run of whole rows.
+    struct LmPiece { const uint8_t* w; size_t row0, rows, bytes; };
+    std::vector<LmPiece> lm_pieces(gpu::VulkanBackend& c) const;
+    mutable std::vector<LmPiece> lm_pieces_cache_; mutable const void* lm_pieces_key_[2] = {nullptr, nullptr};   // worked out once per card/weight
+    bool lm_head_card_matvec(const float* in, float* out);
     // The card a layer is computed on while writing (nullptr = the CPU).
     gpu::VulkanBackend* layer_card(const TransformerLayerWeights& lw) const {
         if (lw.gpu_layer) return &gpu::gpu();
@@ -1472,7 +1615,7 @@ private:
     bool q35_gpu_full_step(const TransformerLayerWeights& lw, int l, float* x, int pos, bool async = false);   // also plain attention layers (see plain_attn_gpu_ok)
     bool plain_attn_gpu_ok() const;
     // layer chaining: consecutive GPU layers are submitted without waiting (the CPU records layer N+1 while the card runs layer N); q35_chain_flush() joins
-    struct Q35ChainKv { int layer; int pos; int nkv; int hd; uint32_t mirror_valid; int slot; };
+    struct Q35ChainKv { int layer; int pos; int nkv; int hd; uint32_t mirror_valid; int slot; void* card = nullptr; };   // card: whose chain slot holds the K/V
     std::vector<Q35ChainKv> q35_chain_kv_;
     void q35_chain_flush(float* x);   // whole full-attn + FFN layer on the GPU (KV mirrored on the card), one submit
 
@@ -1581,6 +1724,12 @@ private:
     // Owns converted F32 copies of scalar/vector tensors originally stored as F16/BF16.
     // Pointers handed to layer weights must stay valid for the model lifetime.
     std::vector<std::vector<float>> f32_tensor_storage_;
+    std::vector<std::vector<uint8_t>> split_ba_storage_;   // beta / alpha split out of a fused GGUF ssm_beta_alpha
+    std::deque<TensorDesc> synth_tensors_;                  // views into fused llama.cpp tensors (qkv|z, beta|alpha): no copy
+    // Qwen 3.5 linear attention: value heads in llama.cpp's TILED order (k0v0 k1v0 .. k0v1 k1v1 ..) instead of grouped by
+    // key head (k0v0 k0v1 .. k1v0 ..). Every llama.cpp Qwen 3.5 GGUF is tiled (its runtime only broadcasts that way); .nxm
+    // files and Training Ground's own GGUFs are grouped. Only matters when value heads outnumber key heads (9B, 27B ..).
+    bool q35_v_tiled_ = false;
 
     // Gemma4 global p-RoPE factors.
     // GGUF loads this as rope_freqs.weight. Current code was loading the tensor
@@ -2010,22 +2159,53 @@ private:
     // GPU-resident decode: while q35_dev_ahead_[l] is set, the card holds the NEWER recurrent/conv state of layer l and the two host vectors above are stale.
     // Anything that reads the host copy calls q35_sync_host(); anything that writes it calls q35_drop_dev() (the card copy is re-uploaded on the next GPU step).
     std::vector<uint8_t> q35_dev_ahead_;
+    std::vector<uint8_t> q35_gpu_said_;   // one message per layer about the card path
+    // Where every layer ACTUALLY computed while writing the first token, printed once: 0 = not seen yet,
+    // 1 = on its card, 2 = on the CPU.  dec_why_ holds the reason when a card holds the layer and the CPU ran it,
+    // including the two cases that used to say nothing at all (no card flagged, card not ready).
+    std::vector<uint8_t> dec_ran_;
+    std::vector<const char*> dec_why_;
+    bool dec_reported_ = false;
+    void dec_mark(int l, bool on_card, const char* why) {
+        if (l < 0 || meta_.n_layers <= 0) return;
+        if ((int)dec_ran_.size() != (int)meta_.n_layers) { dec_ran_.assign((size_t)meta_.n_layers, 0); dec_why_.assign((size_t)meta_.n_layers, nullptr); }
+        if (l >= (int)dec_ran_.size()) return;
+        dec_ran_[(size_t)l] = on_card ? 1 : 2;
+        dec_why_[(size_t)l] = on_card ? nullptr : why;
+    }
+    void report_decode_placement();
+    // Where a written token's time goes, measured on every token, printed once (tokens 2-9 averaged).
+    double dec_loop_ms_ = 0, dec_head_ms_ = 0; int dec_tok_n_ = 0; bool dec_time_said_ = false;
+    struct NxTimeAcc { double* a; std::chrono::steady_clock::time_point t0;
+        explicit NxTimeAcc(double* p) : a(p), t0(std::chrono::steady_clock::now()) {}
+        ~NxTimeAcc() { if (a) *a += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } };
+    std::vector<std::vector<float>> folded_norms_;   // our copies of zero-centred norm weights, with the 1 added
     std::vector<float> q35_kv_out_;   // K,V of the token just produced by the GPU full-attention step (stored into kvcache_)
     void q35_sync_host(int l) {
         for (int i = (l < 0 ? 0 : l); i < (l < 0 ? (int)q35_dev_ahead_.size() : std::min<int>(l + 1, (int)q35_dev_ahead_.size())); ++i) {
             if (!q35_dev_ahead_[i]) continue;
             q35_dev_ahead_[i] = 0;
-            if (i < (int)q35_conv_state_.size() && i < (int)q35_recurrent_state_.size() &&
-                gpu::gpu().q35_state_download(this, i, q35_conv_state_[i].data(), q35_recurrent_state_[i].data())) continue;
-            fprintf(stderr, "[nexus] WARNING: could not read the Qwen3.5 recurrent state of layer %d back from the GPU\n", i); fflush(stderr);
+            // Read it back from the card that ran the layer -- not always card 1. Asking only card 1 is what produced
+            // "could not read the recurrent state of layer 20..30" for every layer on card 2, and left the host copy
+            // stale for the next turn. The layer's own card first, then any other card that might still hold it.
+            bool got = false;
+            if (i < (int)q35_conv_state_.size() && i < (int)q35_recurrent_state_.size()) {
+                std::vector<gpu::VulkanBackend*> order;
+                if (i < (int)layer_weights_.size()) if (gpu::VulkanBackend* own = layer_card(layer_weights_[(size_t)i])) order.push_back(own);
+                for (gpu::VulkanBackend* c : all_cards()) if (std::find(order.begin(), order.end(), c) == order.end()) order.push_back(c);
+                for (gpu::VulkanBackend* c : order)
+                    if (c->q35_state_download(this, i, q35_conv_state_[i].data(), q35_recurrent_state_[i].data())) { got = true; break; }
+            }
+            if (got) continue;
+            fprintf(stderr, "[nexus] WARNING: could not read the Qwen3.5 recurrent state of layer %d back from any card\n", i); fflush(stderr);
         }
     }
     void q35_drop_dev(int l) {
-        gpu::gpu().q35_state_drop(this, l);
+        for (gpu::VulkanBackend* c : all_cards()) c->q35_state_drop(this, l);       // every card: a layer may have moved
         if (l < 0) std::fill(q35_dev_ahead_.begin(), q35_dev_ahead_.end(), (uint8_t)0);
         else if (l < (int)q35_dev_ahead_.size()) q35_dev_ahead_[l] = 0;
     }
-    void q35_kv_drop_all() { gpu::gpu().q35_kv_drop(this, -1); }   // free the card's KV mirrors (reload / new context / destructor)
+    void q35_kv_drop_all() { for (gpu::VulkanBackend* c : all_cards()) c->q35_kv_drop(this, -1); }   // free every card's KV mirrors (reload / new context / destructor)
     void q35_host_acquire(int l) { q35_sync_host(l); q35_drop_dev(l); }   // host copy is about to be read AND modified
 
     // Sampler RNG
@@ -2167,6 +2347,8 @@ TensorDesc* Transformer::find_layer(int layer, const std::string& suffix) {
     if (suffix == "attn_gate.weight")     return try_native({"linear_attn.in_proj_z.weight"});
     if (suffix == "ssm_alpha.weight")     return try_native({"linear_attn.in_proj_a.weight"});
     if (suffix == "ssm_beta.weight")      return try_native({"linear_attn.in_proj_b.weight"});
+    if (suffix == "ssm_beta_alpha.weight" || suffix == "ssm_ba.weight")
+                                             return try_native({"linear_attn.in_proj_ba.weight"});   // HF Qwen3-Next: same per-key-head [b|a] layout
     if (suffix == "ssm_conv1d.weight")    return try_native({"linear_attn.conv1d.weight"});
     if (suffix == "ssm_dt.bias" || suffix == "ssm_dt")
                                              return try_native({"linear_attn.dt_bias"});
@@ -2645,6 +2827,29 @@ inline bool Transformer::build_layer_weights() {
     auto& tensors = const_cast<std::unordered_map<std::string, TensorDesc>&>(parser_->tensors());
 
     f32_tensor_storage_.clear();
+    split_ba_storage_.clear();
+    synth_tensors_.clear();
+
+    {   // which order are the value heads in? (see q35_v_tiled_)
+        std::string a = meta_.arch; for (char& c : a) c = (char)std::tolower((unsigned char)c);
+        const bool q35_arch = a.find("qwen35") != std::string::npos || a.find("qwen3next") != std::string::npos;
+        bool gguf_names = false, fused = false;
+        for (const auto& kvp : tensors) {
+            const std::string& n = kvp.first;
+            if (n.rfind("blk.", 0) == 0) gguf_names = true;
+            if (n.find("attn_qkv_gate") != std::string::npos || n.find("ssm_beta_alpha") != std::string::npos || n.find(".ssm_ba.") != std::string::npos) fused = true;
+        }
+        const bool lcpp_key = parser_->kv().count(meta_.arch + ".ssm.time_step_rank") > 0;   // llama.cpp's converter always writes it
+        const char* e = std::getenv("NEXUS_QWEN35_V_ORDER");
+        q35_v_tiled_ = false;
+        const char* why = nullptr;
+        if (e && *e) { q35_v_tiled_ = !std::strcmp(e, "tiled"); why = "NEXUS_QWEN35_V_ORDER"; }
+        else if (q35_arch && gguf_names && (lcpp_key || fused)) { q35_v_tiled_ = true; why = "a GGUF made by llama.cpp"; }
+        if (q35_arch)
+            fprintf(stderr, "[nexus] Qwen 3.5 value heads: %s order (%s) -- matters only when value heads outnumber key heads; "
+                            "NEXUS_QWEN35_V_ORDER=tiled|grouped overrides\n", q35_v_tiled_ ? "TILED" : "grouped",
+                    why ? why : (gguf_names ? "a GGUF not made by llama.cpp" : "a native .nxm"));
+    }
 
     auto try_find = [&](std::initializer_list<std::string> names) -> TensorDesc* {
         for (const auto& n : names) {
@@ -4453,12 +4658,63 @@ zero_centered_norm_ = false;
         TensorDesc* q35_a    = get("ssm_alpha.weight");
         TensorDesc* q35_b    = get("ssm_beta.weight");
         TensorDesc* q35_ba   = get("ssm_beta_alpha.weight");
+        if (!q35_ba) q35_ba = get("ssm_ba.weight");            // the name llama.cpp actually writes (Qwen3-Next GGUFs)
         TensorDesc* q35_conv = get("ssm_conv1d.weight");
         TensorDesc* q35_dt   = get("ssm_dt.bias");
         if (!q35_dt) q35_dt = get("ssm_dt");
         TensorDesc* q35_A    = get("ssm_a");
         TensorDesc* q35_norm = get("ssm_norm.weight");
         TensorDesc* q35_out  = get("ssm_out.weight");
+
+        // Current llama.cpp fuses two pairs of Qwen 3.5 tensors (its converter's _SHARED_INPUT_MERGES, torch.cat on rows):
+        //   attn_qkv_gate  = [ qkv rows (conv_dim) ][ z rows (value_dim) ]
+        //   ssm_beta_alpha = [ beta rows (v_heads) ][ alpha rows (v_heads) ]   (flat -- unlike Qwen3-Next's grouped ssm_ba)
+        // Rows are whole and contiguous, so each half is a view into the same bytes: no copy, any quant type. Without this
+        // a current llama.cpp Qwen 3.5 GGUF did not load at all ("missing standard attention weights").
+        auto view_rows = [&](TensorDesc* t, uint64_t row0, uint64_t nrows, const char* tag) -> TensorDesc* {
+            const uint64_t rows = t->shape.size() >= 2 ? t->shape[1] : 0;
+            if (!t->data || rows == 0 || t->data_size % rows != 0 || row0 + nrows > rows) return nullptr;
+            const uint64_t rb = t->data_size / rows;
+            synth_tensors_.push_back(*t);
+            TensorDesc& v = synth_tensors_.back();
+            v.name = t->name + tag;
+            v.shape = { t->shape[0], nrows };
+            v.n_elements = t->shape[0] * nrows;
+            v.data_size = rb * nrows;
+            v.data = (uint8_t*)t->data + rb * row0;
+            return &v;
+        };
+        if (!q35_qkv && !q35_z && q35_conv) {
+            if (TensorDesc* qg = get("attn_qkv_gate.weight")) {
+                uint64_t conv_dim = 0; for (uint64_t d : q35_conv->shape) conv_dim = std::max(conv_dim, d);   // [kernel, channels]
+                const uint64_t rows = qg->shape.size() >= 2 ? qg->shape[1] : 0;
+                if (conv_dim && rows > conv_dim) {
+                    q35_qkv = view_rows(qg, 0, conv_dim, "#qkv");
+                    q35_z   = view_rows(qg, conv_dim, rows - conv_dim, "#z");
+                    if (l == active_start && q35_qkv && q35_z) {
+                        fprintf(stderr, "[nexus] llama.cpp Qwen 3.5: attn_qkv_gate read as qkv (%llu rows) + z (%llu rows)\n",
+                                (unsigned long long)conv_dim, (unsigned long long)(rows - conv_dim));
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+        if (q35_ba && !(q35_a && q35_b) && q35_ba->name.find("ssm_beta_alpha") != std::string::npos) {
+            static const bool grouped_forced = [] { const char* e = std::getenv("NEXUS_BA_LAYOUT"); return e && !std::strcmp(e, "grouped"); }();
+            const uint64_t rows = q35_ba->shape.size() >= 2 ? q35_ba->shape[1] : 0;
+            if (!grouped_forced && rows >= 2 && rows % 2 == 0) {
+                q35_b = view_rows(q35_ba, 0, rows / 2, "#beta");
+                q35_a = view_rows(q35_ba, rows / 2, rows / 2, "#alpha");
+                if (q35_a && q35_b) {
+                    q35_ba = nullptr;
+                    if (l == active_start) {
+                        fprintf(stderr, "[nexus] llama.cpp Qwen 3.5: ssm_beta_alpha read as beta (%llu rows) then alpha (%llu rows) "
+                                        "(NEXUS_BA_LAYOUT=grouped for the per-key-head layout)\n", (unsigned long long)(rows / 2), (unsigned long long)(rows / 2));
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
 
         const bool q35_has_split_ba = q35_a && q35_b;
         const bool q35_has_fused_ba = q35_ba != nullptr;
@@ -4565,6 +4821,42 @@ zero_centered_norm_ = false;
             {
                 dump_layer_tensors("bad Qwen35 linear-attention dimensions or missing alpha/beta projection");
                 return false;
+            }
+
+            // GGUF (llama.cpp) stores beta and alpha as ONE tensor, ssm_beta_alpha / ssm_ba, rows grouped per key head:
+            //   [beta_0 .. beta_{r-1}][alpha_0 .. alpha_{r-1}]  for each key head, r = v_heads / k_heads.
+            // The card's whole-layer kernel takes beta and alpha separately, so a fused tensor sent every linear-attention
+            // layer of a GGUF Qwen 3.5 to the CPU. Split it here, once, into two tensors in exactly the order the CPU path
+            // de-interleaves it -- whole rows copied, so it works for any quant type. Costs a copy of a tiny tensor
+            // (2 x v_heads rows). NEXUS_SPLIT_BA=0 keeps it fused.
+            {
+                static const bool split_off = [] { const char* e = std::getenv("NEXUS_SPLIT_BA"); return e && e[0] == '0'; }();
+                const int vh = lw.q35_num_v_heads, kh = lw.q35_num_k_heads;
+                const int rep = kh > 0 ? vh / kh : 0;
+                const size_t rows = (size_t)vh * 2;
+                const size_t bytes = q35_ba ? (size_t)q35_ba->data_size : 0;
+                if (!split_off && lw.q35_ba && q35_ba && rep > 0 && rows && bytes && bytes % rows == 0) {
+                    const size_t rb = bytes / rows;
+                    split_ba_storage_.emplace_back((size_t)vh * rb);
+                    uint8_t* bout = split_ba_storage_.back().data();
+                    split_ba_storage_.emplace_back((size_t)vh * rb);
+                    uint8_t* aout = split_ba_storage_.back().data();
+                    const uint8_t* src = (const uint8_t*)lw.q35_ba;
+                    for (int hk = 0; hk < kh; ++hk)
+                        for (int r = 0; r < rep; ++r) {
+                            const size_t dst = (size_t)hk * rep + r;
+                            std::memcpy(bout + dst * rb, src + ((size_t)hk * 2 * rep + r) * rb, rb);
+                            std::memcpy(aout + dst * rb, src + ((size_t)hk * 2 * rep + rep + r) * rb, rb);
+                        }
+                    lw.q35_b = bout; lw.q35_b_type = lw.q35_ba_type;
+                    lw.q35_a = aout; lw.q35_a_type = lw.q35_ba_type;
+                    lw.q35_ba = nullptr;
+                    if (l == active_start) {
+                        fprintf(stderr, "[nexus] GGUF Qwen 3.5: the fused beta/alpha tensor (ssm_beta_alpha, %zu rows) is split into "
+                                        "beta and alpha so the card can run these layers (NEXUS_SPLIT_BA=0 keeps it fused)\n", rows);
+                        fflush(stderr);
+                    }
+                }
             }
             {
                 float amin =  1e30f;
@@ -5014,6 +5306,46 @@ zero_centered_norm_ = false;
             lw.attn_k_norm_zc    = nc_attn_k_norm_.decided_zc;
         }
 
+        // A zero-centred norm weight (x * rstd * (1 + w)) is the same thing as a plain one (x * rstd * w') with
+        // w' = 1 + w: it is how the file stores it, not a different calculation.  Add the 1 once, here, into our own
+        // copy of the weight, and every path afterwards sees plain weights.  The card's whole-layer paths refused any
+        // layer with a zero-centred norm, so every linear-attention and full-attention layer of a native Qwen 3.5
+        // model ran on the CPU while its weights sat in graphics memory.  NEXUS_NORM_FOLD_ONE=0 keeps the old way.
+        static const bool fold_one = [] { const char* e = std::getenv("NEXUS_NORM_FOLD_ONE"); return !(e && e[0] == '0'); }();
+        if (fold_one) {
+            std::unordered_map<const void*, const float*> made;     // a weight shared by two layers is copied once
+            const size_t hid = (size_t)meta_.hidden_dim;
+            auto fold = [&](auto*& w, size_t n, bool& flag) {            // the pointer is void* for some norms, float* for others
+                if (!flag || !w || n == 0) return;
+                const void* key = (const void*)w;
+                auto it = made.find(key);
+                if (it == made.end()) {
+                    // our own copy: the file's own pages may be mapped read-only
+                    folded_norms_.emplace_back((const float*)key, (const float*)key + n);
+                    for (float& v : folded_norms_.back()) v += 1.0f;
+                    it = made.emplace(key, folded_norms_.back().data()).first;
+                }
+                w = (decltype(w))it->second;
+                flag = false;
+            };
+            for (auto& lw : layer_weights_) {
+                fold(lw.attn_norm,      hid, lw.attn_norm_zc);
+                fold(lw.ffn_norm,       hid, lw.ffn_norm_zc);
+                fold(lw.attn_post_norm, hid, lw.attn_post_norm_zc);
+                fold(lw.ffn_post_norm,  hid, lw.ffn_post_norm_zc);
+                // q/k norms are left alone: the card's attention shader already takes a zero-centred flag for them.
+            }
+            if (rms_final_weight && zero_centered_norm_) {
+                bool f = true; fold(rms_final_weight, hid, f);
+                zero_centered_norm_ = false;
+            }
+            if (!made.empty()) {
+                fprintf(stderr, "[nexus] Norm: %zu zero-centred norm weights folded into plain weights (the same maths; the card's "
+                                "whole-layer paths can now take the layers that hold them)\n", made.size());
+                fflush(stderr);
+            }
+        }
+
         auto avg = [](const NormClassStats& s) -> double {
             return s.n_samples ? (s.sum_mean_abs / s.n_samples) : 0.0;
         };
@@ -5453,6 +5785,33 @@ struct NxProfScope {
 
 inline int32_t Transformer::forward(const std::vector<int32_t>& tokens, int pos) {
     if (!loaded_) return -1;
+    if (!gpu_setup_done_) finish_gpu_setup();        // every card has had its turn by now
+    // Prompt-picked experts: after a prompt (prefill_batch sets moe_due_), and every so many written tokens.
+    if (!moe_cards_.empty()) {
+        static const int every = [] { const char* e = std::getenv("NEXUS_MOE_RECHECK"); const int v = e ? std::atoi(e) : 0; return v > 0 ? v : 256; }();
+        if (moe_due_) moe_rebalance("prompt read");
+        else if (++moe_since_ >= every) moe_rebalance("while writing");
+    }
+
+    // Once per run: where the time of a written token goes (tokens 2-9 averaged; the first one warms things up).
+    const bool dec_timed = pos > 0 && !dec_time_said_;      // forward() is one position at a time (tokens[pos])
+    if (dec_timed) {
+        ++dec_tok_n_;
+        if (dec_tok_n_ == 2) { dec_loop_ms_ = 0; dec_head_ms_ = 0; }
+        if (dec_tok_n_ == 10) {
+            const double n = 8.0, lay = dec_loop_ms_ / n, head = dec_head_ms_ / n;
+            std::string where = "the CPU";
+#ifdef NEXUS_VULKAN
+            if (gpu_lm_head_) where = lm_card().info().device_name;
+#endif
+            fprintf(stderr, "[decode] time per written token (avg of 8): layers %.1f ms + final norm/lm_head on %s %.1f ms = %.1f ms "
+                            "(%.1f tokens/s before sampling)\n", lay, where.c_str(), head, lay + head, 1000.0 / std::max(0.001, lay + head));
+            if (moe_runs_all_) fprintf(stderr, "[decode] experts run on a card so far: %.0f%% (%llu of %llu)\n", 100.0 * (double)moe_runs_card_ / (double)moe_runs_all_,
+                                       moe_runs_card_, moe_runs_all_);
+            fflush(stderr);
+            dec_time_said_ = true;
+        }
+    }
 
     const int hidden = (int)meta_.hidden_dim;
     const int vocab  = (int)meta_.vocab_size;
@@ -5528,6 +5887,7 @@ inline int32_t Transformer::forward(const std::vector<int32_t>& tokens, int pos)
     // 2. Run through each transformer layer
     {
         NxProfScope prof_loop(&nx_prof_extra().loop);
+        NxTimeAcc dec_loop_t(dec_timed ? &dec_loop_ms_ : nullptr);
         // Qwen3.5 on the GPU: consecutive GPU layers are submitted without waiting (see q35_chain_flush).  NEXUS_GPU_CHAIN=0 turns it off.
 #ifdef NEXUS_VULKAN
         static const bool chain_env_on = [] { const char* e = std::getenv("NEXUS_GPU_CHAIN"); return !(e && e[0] == '0'); }();
@@ -5536,20 +5896,28 @@ inline int32_t Transformer::forward(const std::vector<int32_t>& tokens, int pos)
         const bool chain_try = false;
 #endif
         static unsigned long long n_fa_ok = 0, n_fa_no = 0, n_lin_no = 0;   // how often each layer kind stayed in / dropped out of the chain
+        gpu::VulkanBackend* chain_card = nullptr;      // the card whose chain currently holds the hidden state
         for (int l = 0; l < (int)meta_.n_layers; ++l) {
             LayerPinGuard pin_guard(*mm_, l);
             if (chain_try) {
                 const TransformerLayerWeights& clw = layer_weights_[l];
+                // Moving to another card: the hidden state is still on the last one. Bring it home first, then the
+                // next card picks it up -- without this card 2 would start from a stale copy.
+                gpu::VulkanBackend* this_card = layer_card(clw);
+                if (chain_card && this_card != chain_card) { q35_chain_flush(x); chain_card = nullptr; }
                 bool done = false;
                 if (clw.qwen35_linear) { done = q35_gpu_linear_step(clw, l, x, true); if (!done) ++n_lin_no; }
                 else if (!clw.moe) { done = q35_gpu_full_step(clw, l, x, pos, true); if (done) ++n_fa_ok; else ++n_fa_no; }   // gated (Qwen3.5) or plain attention layer
-                if (done) continue;
+                if (done) { chain_card = this_card; continue; }
                 q35_chain_flush(x);                      // x is on the card: bring it back before the synchronous path touches it
+                chain_card = nullptr;
             }
             forward_layer(l, x, pos);
         }
+        if (!dec_reported_) report_decode_placement();        // once per run, after a whole token has been written
         {   // the join: waits for the last submitted layers (and copies the hidden state + new K/V rows back)
-            const bool was_open = chain_try && gpu::gpu().chain_is_open();
+            bool was_open = false;
+            if (chain_try) for (gpu::VulkanBackend* c : all_cards()) was_open = was_open || c->chain_is_open();
             const auto tj = std::chrono::steady_clock::now();
             q35_chain_flush(x);
             if (was_open) {
@@ -5571,6 +5939,7 @@ inline int32_t Transformer::forward(const std::vector<int32_t>& tokens, int pos)
         }
     }
     NxProfScope prof_head(&nx_prof_extra().head);   // final norm + lm_head + logit post-processing, until forward() returns
+    NxTimeAcc dec_head_t(dec_timed ? &dec_head_ms_ : nullptr);
 
     // ------ DIAG: post-decoder residual stream (first token only) ----------
     // After all layers complete, before output_norm. This is the residual
@@ -5715,8 +6084,7 @@ inline int32_t Transformer::forward(const std::vector<int32_t>& tokens, int pos)
     // Native .nxm NQ lm_head is now handled by the normal CPU matmul route.
     // Do not send private NQ*_G64 rows to GPU kernels that only know GGUF layouts.
     if (gpu_lm_head_ && nx_lm_head_gpu_ok(lm_head_type)) {
-        lm_done = gpu::gpu().mat_vec(lm_head_weight, head_in, logits_.data(),
-                                     (size_t)vocab, (size_t)hidden, lm_head_type);
+        lm_done = lm_head_card_matvec(head_in, logits_.data());
     }
     if (!lm_done) {
         static std::atomic<int> lm_mainroute_logs{0};
@@ -5813,8 +6181,14 @@ inline int32_t Transformer::forward(const std::vector<int32_t>& tokens, int pos)
 }
 // --------- GPU layer offloading ------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+// Testing hook: pretend every card has this much memory free, so layer placement can be exercised without
+// filling a real card.  NEXUS_FAKE_VRAM_FREE_MB=<MB>; 0 / unset = ask the driver.
+inline size_t nx_fake_vram_free_mb() {
+    const char* e = std::getenv("NEXUS_FAKE_VRAM_FREE_MB");     // testing only; read each time so a test can change it mid-run
+    return e ? (size_t)std::max(0LL, atoll(e)) : (size_t)0;
+}
 inline int Transformer::set_gpu_layers(int n) {
-    if (n <= 0) {
+    if (n == 0 || n < -2) {          // -1 = every owned layer, -2 = as many as fit
         n_gpu_layers_ = 0;
         gpu::gpu().shutdown();
         fprintf(stderr, "[nexus] GPU offload disabled\n"); fflush(stderr);
@@ -5829,7 +6203,8 @@ inline int Transformer::set_gpu_layers(int n) {
     const int own_start = (active_layer_end_ >= 0) ? std::max(0, active_layer_start_) : 0;
     const int own_end   = (active_layer_end_ >= 0) ? std::min(max_layers, active_layer_end_) : max_layers;
     const int own_count = std::max(0, own_end - own_start);
-    n = (n == -1) ? own_count : std::min(n, own_count);
+    const bool maximize = (n == -2);                 // "as many layers as fit on this card"
+    n = (n == -1 || maximize) ? own_count : std::min(n, own_count);
 
     // Initialize Vulkan
     auto& g = gpu::gpu();
@@ -5842,12 +6217,19 @@ inline int Transformer::set_gpu_layers(int n) {
         }
     }
 
-    g.set_gpu_layers(n);
-    n_gpu_layers_ = n;
-
     // Mark which owned layers will use the primary GPU.
     for (int l = 0; l < (int)layer_weights_.size(); ++l)
         layer_weights_[l].gpu_layer = false;
+    if (maximize) {                                  // measure before anything is uploaded
+        const int fit = layers_that_fit(g, own_start, g.info().device_name.c_str());
+        n = std::min(std::max(fit, 0), own_count);
+        if (n == 0) {
+            fprintf(stderr, "[nexus] no layer fits on %s -- running on the CPU\n", g.info().device_name.c_str());
+            n_gpu_layers_ = 0; gguf::nx_pin_direct_layers_from(0); return 0;
+        }
+    }
+    g.set_gpu_layers(n);
+    n_gpu_layers_ = n;
     for (int i = 0; i < n_gpu_layers_; ++i) {
         int l = own_start + i;
         if (l >= 0 && l < (int)layer_weights_.size())
@@ -5866,39 +6248,56 @@ inline int Transformer::set_gpu_layers(int n) {
         // so nothing is copied twice and nothing is left half-uploaded.
         const gpu::GpuInfo gi_up = g.info();
         const bool discrete = !gi_up.unified_memory && gi_up.vram_bytes > 0;
-        const size_t keep_free = 640ull * 1024ull * 1024ull;
-        size_t prev_used = g.weight_cache_used();
+        // What the card really has free, asked once before anything is uploaded.  This used to go by the card's SIZE and
+        // reserve a flat 640 MB against the BIGGEST layer seen so far, which stopped filling a 3 GB card at about half.
+        size_t free_now = 0;
+        bool real_free = g.vram_free_now(free_now);
+        if (!real_free || free_now == 0) free_now = (size_t)gi_up.vram_bytes;
+        if (const size_t fake = nx_fake_vram_free_mb()) { free_now = fake << 20; real_free = true; }   // testing
+        const size_t keep_free = card_keep_bytes(free_now);
+        const size_t start_used = g.weight_cache_used();
+        const size_t room = free_now > keep_free ? free_now - keep_free : 0;
+        if (discrete)
+            fprintf(stderr, "[nexus] %s: %zu MB free%s, keeping %zu MB of it free -- room for %zu MB of layers\n",
+                    gi_up.device_name.c_str(), free_now >> 20, real_free ? "" : " (estimated from its size: the driver does not report it)",
+                    keep_free >> 20, room >> 20);
+        size_t prev_used = start_used;
         size_t biggest_layer = 0;
         int fitted = n_gpu_layers_;
         int vram_layers = -1;     // first layer that is read from system RAM instead of VRAM (-1 = none)
         bool host_mode = false;
-        auto enter_host_mode = [&](int i) -> bool {
-            if (!discrete || host_mode || !g.host_import_available()) return false;
-            host_mode = true; vram_layers = i; g.set_host_only_weights(true); return true;
+        // When this card's memory is full the layers left over are NOT handed to system RAM here: another card may
+        // have room for them in its own memory, and only finish_gpu_setup() knows, once every card has had its turn.
+        // Doing it here meant layers ran at RAM speed on card 1 while card 2 sat with memory to spare.
+        auto leave_for_later = [&](int i) {
+            if (host_pending_first_ < 0 && discrete && g.host_import_available()) {
+                host_pending_first_ = own_start + i;
+                host_pending_last_  = own_start + n_gpu_layers_;
+            }
         };
+        (void)host_mode; (void)vram_layers;
         for (int i = 0; i < n_gpu_layers_; ++i) {
             int l = own_start + i;
             if (l < 0 || l >= (int)layer_weights_.size()) continue;
-            if (discrete && !host_mode && biggest_layer > 0 &&
-                prev_used + biggest_layer + keep_free > gi_up.vram_bytes) {
-                if (!enter_host_mode(i)) { fitted = i; break; }
-            }
-            bool ok = eager_upload_layer_weights(l, g);
-            if (!ok && !host_mode && enter_host_mode(i)) ok = eager_upload_layer_weights(l, g);   // VRAM ran out unexpectedly: retry this layer from RAM
-            size_t now_used = g.weight_cache_used();
-            if (!host_mode && now_used > prev_used) biggest_layer = std::max(biggest_layer, now_used - prev_used);
+            size_t need = turbo_layer_weight_bytes(l);
+            if (need == 0) need = biggest_layer;             // size unknown: go by the biggest layer seen
+            if (discrete && need > 0 && (prev_used - start_used) + need > room) { leave_for_later(i); fitted = i; break; }
+            if ((int)primary_card_w_.size() < (int)layer_weights_.size()) primary_card_w_.resize(layer_weights_.size());
+            std::vector<const void*> mine;
+            const bool ok = eager_upload_layer_weights(l, g, &mine);
+            primary_card_w_[(size_t)l] = mine;
+            const size_t now_used = g.weight_cache_used();
+            if (now_used > prev_used) biggest_layer = std::max(biggest_layer, now_used - prev_used);
             prev_used = now_used;
-            if (!ok) { fitted = i; break; }
+            if (!ok) { leave_for_later(i); fitted = i; break; }                       // its memory ran out sooner than the driver said
         }
-        if (host_mode) g.set_host_only_weights(false);
-        if (vram_layers >= 0 && fitted > vram_layers)
-            fprintf(stderr, "[nexus] Placement: layers %d-%d in VRAM (%zu of %zu MB); layers %d-%d computed on the GPU but read from system RAM "
-                            "(no extra copy, runs at RAM speed)\n",
-                    own_start, own_start + vram_layers - 1, prev_used / (1024*1024), (size_t)(gi_up.vram_bytes / (1024*1024)),
-                    own_start + vram_layers, own_start + fitted - 1);
+        if (discrete)
+            fprintf(stderr, "[nexus] %s: layers hold %zu MB of the %zu MB of room\n", gi_up.device_name.c_str(),
+                    (prev_used - start_used) >> 20, room >> 20);
         if (fitted < n_gpu_layers_) {
-            fprintf(stderr, "[nexus] %d of %d requested layers could be put on the GPU -- the other %d layers run on the CPU\n",
-                    fitted, n_gpu_layers_, n_gpu_layers_ - fitted);
+            fprintf(stderr, "[nexus] %s took %d of the %d layers asked of it; the other %d go to the next card, or to this card read from "
+                            "system RAM, or to the CPU -- whichever is left when every card has had its turn\n",
+                    gi_up.device_name.c_str(), fitted, n_gpu_layers_, n_gpu_layers_ - fitted);
             for (int i = fitted; i < n_gpu_layers_; ++i) {
                 int l = own_start + i;
                 if (l >= 0 && l < (int)layer_weights_.size()) layer_weights_[l].gpu_layer = false;
@@ -5906,9 +6305,10 @@ inline int Transformer::set_gpu_layers(int n) {
             n_gpu_layers_ = fitted;
             g.set_gpu_layers(fitted);
         }
-        // Layers that stay on the CPU need their weights in RAM (those read in place from the model file are copied now);
-        // layers that live on the card keep no RAM copy.
-        gguf::nx_pin_direct_layers_from(own_start + n_gpu_layers_);
+        // Which layers need a RAM copy is only known once EVERY card has been given its layers, so the copying waits
+        // for finish_gpu_setup() (the first forward pass calls it if nothing else did).  Doing it here copied the
+        // layers meant for the second card into RAM and then uploaded them to that card anyway.
+        gpu_setup_done_ = false;
     }
     fprintf(stderr, "[nexus] Layer weight upload complete\n");
     fflush(stderr);
@@ -6031,17 +6431,19 @@ inline int Transformer::layers_that_fit(gpu::VulkanBackend& b, int first_layer, 
 #if defined(NEXUS_VULKAN)
     size_t fr = 0; const bool real = b.vram_free_now(fr);
     if (!real) fr = (size_t)b.info().vram_bytes;
-    const size_t room = fr > card_fill_keep_bytes_ ? fr - card_fill_keep_bytes_ : 0;
+    const size_t keep = card_keep_bytes(fr);
+    const size_t room = fr > keep ? fr - keep : 0;
     int cnt = 0; size_t sum = 0;
     for (int l = first_layer; l < (int)meta_.n_layers; ++l) {
         if (layer_weights_[l].gpu_layer || layer_weights_[l].gpu2_layer) break;
-        const size_t bl = turbo_layer_weight_bytes(l);
-        if (bl == 0 || sum + bl > room) break;
+        size_t bl = turbo_layer_weight_bytes(l);
+        if (bl == 0) bl = cnt ? sum / (size_t)cnt : (room / 8);     // unknown size: go by the layers already measured
+        if (sum + bl > room) break;
         sum += bl; ++cnt;
     }
     fprintf(stderr, "[nexus] %s, Maximize: %d layers fit (%zu MB of %zu MB free%s, keeping %zu MB free)\n",
             card_name ? card_name : "card", cnt, sum >> 20, fr >> 20, real ? "" : " -- estimated from its size, the driver doesn't report free memory",
-            card_fill_keep_bytes_ >> 20);
+            keep >> 20);
     fflush(stderr);
     return cnt;
 #else
@@ -6057,13 +6459,15 @@ inline int Transformer::fill_other_card(gpu::VulkanBackend& g, int first, int n,
         const size_t kv_dim = (size_t)(meta_.n_kv_heads * meta_.head_dim);
         g.init_activation_bufs(meta_.hidden_dim, q_dim, kv_dim, meta_.ffn_dim);
     }
-    size_t fr = 0; const bool real = g.vram_free_now(fr);
+    size_t fr = 0; bool real = g.vram_free_now(fr);
+    if (const size_t fake = nx_fake_vram_free_mb()) { fr = fake << 20; real = true; }                  // testing
     if (!real) {     // no driver report: estimate from the card's size, and keep extra back for what it can't see (the desktop)
         const size_t v = (size_t)g.info().vram_bytes, u = g.weight_cache_used() + (256ull << 20);
         fr = v > u ? v - u : 0;
         fprintf(stderr, "[nexus] graphics card %d: the driver doesn't report free memory -- estimating from its size (256 MB extra kept back)\n", card_no);
     }
-    size_t room = fr > card_fill_keep_bytes_ ? fr - card_fill_keep_bytes_ : 0;
+    const size_t keep = card_keep_bytes(fr);
+    size_t room = fr > keep ? fr - keep : 0;
     g.set_weight_cache_budget(g.weight_cache_used() + room);
     if ((int)other_card_w_.size() < nl) other_card_w_.resize((size_t)nl);
     const auto t0 = std::chrono::steady_clock::now();
@@ -6073,7 +6477,7 @@ inline int Transformer::fill_other_card(gpu::VulkanBackend& g, int first, int n,
         if (need > room) {
             fprintf(stderr, "[nexus] graphics card %d (%s): layer %d (%zu MB) doesn't fit (%zu MB left, keeping %zu MB free) -- "
                             "it and the layers after it that were meant for this card run on the CPU\n",
-                    card_no, g.info().device_name.c_str(), l, need >> 20, room >> 20, card_fill_keep_bytes_ >> 20);
+                    card_no, g.info().device_name.c_str(), l, need >> 20, room >> 20, keep >> 20);
             break;
         }
         std::vector<const void*> mine;
@@ -6106,6 +6510,10 @@ inline int Transformer::fill_other_card(gpu::VulkanBackend& g, int first, int n,
         fprintf(stderr, "[load] %d%%  Moving layers onto graphics card %d (%d of %d)\n", (int)(100.0 * done / std::max(1, n)), card_no, done, n);
         fflush(stderr);
     }
+    // The budget above was set wide so the layers could upload.  Hand the rest of the card back now: the KV mirror
+    // counts the weight budget as used, so a budget covering the whole card left a full-attention layer on this card
+    // with no room to mirror its conversation memory -- and it then ran on the CPU ("cap_bytes == 0").
+    g.set_weight_cache_budget(g.weight_cache_used() + (64ull << 20));
     const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     size_t fr2 = 0; const bool real2 = g.vram_free_now(fr2);
     fprintf(stderr, "[nexus] graphics card %d (%s): %d layers (%zu MB) on the card for writing in %.1f s%s\n",
@@ -6312,8 +6720,9 @@ inline size_t Transformer::compute_and_set_turbo_vram_budget(size_t kv_attn_rese
     if (budget_real && gi.vram_bytes > 0 && !gi.unified_memory) {
         size_t fr = 0;
         if (gpu::gpu().vram_free_now(fr)) {
-            const size_t safety = (size_t)env_mb("NEXUS_TURBO_VRAM_SAFETY_MB", 384) * 1024ull * 1024ull;
-            const size_t hold   = kv_attn_reserve_bytes + safety;
+            // the same processing buffer as everywhere else, not a second flat number
+            const size_t safety = (size_t)env_mb("NEXUS_TURBO_VRAM_SAFETY_MB", 0) * 1024ull * 1024ull;
+            const size_t hold   = kv_attn_reserve_bytes + (safety ? safety : card_keep_bytes(fr));
             const size_t real_cap = gpu::gpu().weight_cache_used() + (fr > hold ? fr - hold : 0);
             if (final_budget > real_cap) {
                 if (real_cap < required_window)
@@ -6700,6 +7109,9 @@ inline bool Transformer::turbo_mat_mat_family_or_cpu(const void* W, QuantType wt
         if (Y && rows && n_tokens) std::memset(Y, 0, rows * n_tokens * sizeof(float));
         return false;
     }
+    // The card has no BF16 kernel, so a BF16 weight used to read "family=unsupported ... CPU-NOPIPE" and go to the
+    // processor during the prompt as well. Widen it to F32 (exact) and it runs on the card like everything else.
+    bf16widen(W, wt, rows, cols);
 
     const bool is_native = turbo_is_native_nq_type(wt);
     const bool is_std    = turbo_is_standard_gguf_mm_type(wt);
@@ -6977,6 +7389,7 @@ inline void Transformer::forward_qwen35_linear_batch(const TransformerLayerWeigh
     bool q35_scan_gpu_ok = false;
 #ifdef NEXUS_VULKAN
     if (turbo_gpu_stream_ && gpu::gpu().ready() && hd <= 256 && n_tokens >= 16) {
+        gpu::gpu().set_q35_v_tiled(q35_v_tiled_);
         q35_scan_gpu_ok = gpu::gpu().qwen35_scan(conv_out.data(),
                                                  a.data(),
                                                  b.data(),
@@ -7065,7 +7478,7 @@ inline void Transformer::forward_qwen35_linear_batch(const TransformerLayerWeigh
         const float* zt = z.data() + (size_t)t * (size_t)value_dim;
 
         for (int hv_i = 0; hv_i < vh; ++hv_i) {
-            const int hk_i = hv_i / repeat;
+            const int hk_i = q35_v_tiled_ ? hv_i % (vh / repeat) : hv_i / repeat;   // tiled: llama.cpp GGUF
             const float* q = q_normed.data() + (size_t)hk_i * (size_t)hd;
             const float* k = k_normed.data() + (size_t)hk_i * (size_t)hd;
             const float* v = v_base + (size_t)hv_i * (size_t)hd;
@@ -7127,6 +7540,222 @@ inline void Transformer::forward_qwen35_linear_batch(const TransformerLayerWeigh
                          "linear_attn.out_proj", layer_idx);
 }
 
+// The router's choice for one token: top_k experts and their final weights (normalised / scaled) -- the same arithmetic as
+// forward_ffn's routing, so the prompt (batched) and the per-token path pick the same experts with the same weights.
+inline void Transformer::moe_route_one(const TransformerLayerWeights& lw, const float* logits, int* idx, float* wout) const {
+    const int n_exp = (int)lw.moe_expert_count;
+    const int top_k = std::max(1, std::min((int)lw.moe_top_k, n_exp));
+    std::vector<float> route_weight((size_t)n_exp, 0.0f);
+    auto sigmoid = [](float v) -> float { if (v > 80.0f) return 1.0f; if (v < -80.0f) return 0.0f; return 1.0f / (1.0f + expf(-v)); };
+    auto masked_softmax = [&](const std::vector<float>& scores) -> std::vector<float> {
+        std::vector<float> out(scores.size(), 0.0f);
+        float mx = -1.0e30f; for (float v : scores) if (v > mx) mx = v;
+        if (mx <= -0.9e30f) return out;
+        float sum = 0.0f;
+        for (size_t i = 0; i < scores.size(); ++i) { if (scores[i] <= -0.9e30f) out[i] = 0.0f; else { out[i] = expf(scores[i] - mx); sum += out[i]; } }
+        if (sum > 0.0f) for (float& v : out) v /= sum;
+        return out;
+    };
+    float selected_sum = 0.0f;
+    if (lw.moe_router_kind == 1 && top_k == 2 && n_exp >= 2) {
+        const float jitter_eps = (lw.moe_router_jitter_eps > 0.0f) ? lw.moe_router_jitter_eps : 0.01f;
+        const float threshold_scale = 2.0f * jitter_eps, NEG = -1.0e30f;
+        int e0 = 0; for (int i = 1; i < n_exp; ++i) if (logits[i] > logits[e0]) e0 = i;
+        const float max0 = logits[e0];
+        std::vector<float> masked0((size_t)n_exp, NEG);
+        for (int i = 0; i < n_exp; ++i) {
+            float factor = std::max(std::fabs(logits[i]), max0); if (factor < 1.0e-12f) factor = 1.0e-12f;
+            masked0[i] = ((max0 - logits[i]) / factor) > threshold_scale ? NEG : logits[i];
+        }
+        const float w0 = masked_softmax(masked0)[e0];
+        std::vector<float> scores1(logits, logits + n_exp); scores1[e0] = NEG;
+        int e1 = (e0 == 0) ? 1 : 0; for (int i = 0; i < n_exp; ++i) if (scores1[i] > scores1[e1]) e1 = i;
+        const float max1 = scores1[e1];
+        std::vector<float> masked1((size_t)n_exp, NEG);
+        for (int i = 0; i < n_exp; ++i) {
+            float factor = std::max(std::fabs(logits[i]), max1); if (factor < 1.0e-12f) factor = 1.0e-12f;
+            masked1[i] = ((max1 - logits[i]) / factor) > threshold_scale ? NEG : scores1[i];
+        }
+        const float w1 = masked_softmax(masked1)[e1];
+        idx[0] = e0; idx[1] = e1; route_weight[e0] += w0; route_weight[e1] += w1; selected_sum = w0 + w1;
+    } else {
+        std::vector<float> select_score((size_t)n_exp, 0.0f);
+        if (lw.moe_router_kind == 2 || lw.moe_router_bias) {
+            for (int i = 0; i < n_exp; ++i) {
+                const float p = sigmoid(logits[i]);
+                route_weight[i] = p; select_score[i] = p + (lw.moe_router_bias ? lw.moe_router_bias[i] : 0.0f);
+            }
+        } else {
+            route_weight.assign(logits, logits + n_exp);
+            cpu::softmax(route_weight.data(), (size_t)n_exp);
+            select_score = route_weight;
+        }
+        std::vector<int> order((size_t)n_exp); std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + top_k, order.end(), [&](int a, int b) { return select_score[a] > select_score[b]; });
+        for (int j = 0; j < top_k; ++j) { idx[j] = order[j]; selected_sum += route_weight[idx[j]]; }
+    }
+    for (int j = 0; j < top_k; ++j) {
+        float w = route_weight[idx[j]];
+        if (lw.moe_normalize_topk && selected_sum > 1e-12f) w /= selected_sum;
+        wout[j] = w * lw.moe_route_scale;
+    }
+}
+
+// The experts for a whole prompt slice at once: the router for every token, then each expert used by the slice runs ONE
+// matrix-matrix pass over just the tokens that picked it --
+//   on the card that holds it (prompt-picked / home experts: nothing to upload),
+//   or streamed through the prompt card when enough tokens picked it to pay for the upload (NEXUS_MOE_STREAM_MIN, 24),
+//   or on the CPU -- at the same time as the cards.
+// Results are summed per token in the same order as the per-token path (routed by rank, then shared).
+inline bool Transformer::forward_moe_ffn_batch(const TransformerLayerWeights& lw, const float* xb, float* out, int layer_idx, int n) {
+    const int hidden = (int)meta_.hidden_dim, n_exp = (int)lw.moe_expert_count;
+    const int top_k = std::max(1, std::min((int)lw.moe_top_k, n_exp));
+    if (!lw.moe || !lw.moe_router || n <= 0 || n_exp <= 0) return false;
+    // layouts this doesn't do (fused gate+up, transposed, per-expert tensors): the caller's per-token path does them
+    gpu::VulkanBackend::MoeJob probe{};
+    if (!moe_expert_job(lw, 0, probe)) return false;
+    const bool shared = lw.moe_has_shared && lw.wgate_shexp && lw.wup_shexp && lw.wdown_shexp;
+    gpu::VulkanBackend::MoeJob sj{};
+    if (shared && !moe_expert_job(lw, n_exp, sj)) return false;
+    const size_t H = (size_t)hidden;
+    constexpr int TILE = 512;
+    if (n > TILE) {
+        for (int t0 = 0; t0 < n; t0 += TILE) {
+            const int c = std::min(TILE, n - t0);
+            if (!forward_moe_ffn_batch(lw, xb + (size_t)t0 * H, out + (size_t)t0 * H, layer_idx, c)) return false;
+        }
+        return true;
+    }
+    // 1. router + choice per token
+    std::vector<float> logits((size_t)n * n_exp);
+    cpu::mat_mat(lw.moe_router, xb, logits.data(), (size_t)n_exp, H, (size_t)n, lw.moe_router_type, n_threads_);
+    std::vector<int> idx((size_t)n * top_k); std::vector<float> wt((size_t)n * top_k);
+    nx_par_range(n, n_threads_, [&](int a, int b) {
+        for (int t = a; t < b; ++t) moe_route_one(lw, logits.data() + (size_t)t * n_exp, idx.data() + (size_t)t * top_k, wt.data() + (size_t)t * top_k);
+    });
+    const bool use_ok = layer_idx >= 0 && layer_idx < (int)moe_use_.size() && (int)moe_use_[(size_t)layer_idx].size() > n_exp;
+    // 2. per expert: which (token, rank) slots picked it; slot n*top_k + t is token t's shared expert
+    const int n_slots = n * top_k + (shared ? n : 0);
+    std::vector<std::vector<int>> by_e((size_t)n_exp + 1);
+    for (int t = 0; t < n; ++t)
+        for (int j = 0; j < top_k; ++j) {
+            const int e = idx[(size_t)t * top_k + j];
+            if (use_ok) moe_use_[(size_t)layer_idx][(size_t)e] += 1.0f;
+            if (wt[(size_t)t * top_k + j] != 0.0f) by_e[(size_t)e].push_back(t * top_k + j);
+        }
+    if (shared) for (int t = 0; t < n; ++t) by_e[(size_t)n_exp].push_back(n * top_k + t);
+    std::vector<float> res((size_t)n_slots * H, 0.0f);
+    // 3. where each expert runs: card index (resident), -2 (streamed through the prompt card), -1 (CPU)
+    static const int stream_min = [] { const char* e = std::getenv("NEXUS_MOE_STREAM_MIN"); const int v = e ? std::atoi(e) : 24; return v > 0 ? v : 24; }();
+    gpu::VulkanBackend* pcard = nullptr;
+#ifdef NEXUS_VULKAN
+    pcard = prefill_card_for_layer(layer_idx);
+    if (pcard && !pcard->ready()) pcard = nullptr;
+#endif
+    const size_t nc = moe_cards_.size();
+    // [c] = experts for card c, [nc] = streamed through the prompt card; .second = streamed (evict after use)
+    std::vector<std::vector<std::pair<int, bool>>> card_list(nc + 1);
+    std::vector<int> cpu_list;
+    for (int e = 0; e <= n_exp; ++e) {
+        const int cnt = (int)by_e[(size_t)e].size();
+        if (!cnt) continue;
+        int where = -1;
+        const int r = (layer_idx >= 0 && layer_idx < (int)moe_res_.size() && (int)moe_res_[(size_t)layer_idx].size() > e) ? moe_res_[(size_t)layer_idx][(size_t)e] : -1;
+        if (r >= 0 && r < (int)nc) where = r;
+        else if (pcard && cnt >= stream_min) {
+            gpu::VulkanBackend::MoeJob j{};
+#ifdef NEXUS_VULKAN
+            if (moe_expert_job(lw, e, j) && pcard->mat_mat_supported(j.gate_t) && pcard->mat_mat_supported(j.up_t) && pcard->mat_mat_supported(j.down_t)) where = -2;
+#endif
+        }
+        if (where >= 0) card_list[(size_t)where].push_back({e, false});
+        else if (where == -2) card_list[nc].push_back({e, true});
+        else cpu_list.push_back(e);
+    }
+    // the prompt card may also be one of the expert cards: then it is ONE list (one thread per card, never two)
+    for (size_t c = 0; c < nc; ++c)
+        if (moe_cards_[c] == pcard && !card_list[nc].empty()) { card_list[c].insert(card_list[c].end(), card_list[nc].begin(), card_list[nc].end()); card_list[nc].clear(); }
+    // one expert, all its tokens: gather -> gate, up -> silu*up -> down -> scatter into its slots
+    auto run_expert = [&](int e, gpu::VulkanBackend* card, bool evict_after) -> bool {
+        gpu::VulkanBackend::MoeJob j{};
+        moe_expert_job(lw, e, j);
+        const std::vector<int>& sl = by_e[(size_t)e];
+        const size_t m = sl.size(), F = j.ffn;
+        std::vector<float> X(m * H), G(m * F), U(m * F), D(m * H);
+        for (size_t k = 0; k < m; ++k) {
+            const int s = sl[k]; const int t = s < n * top_k ? s / top_k : s - n * top_k;
+            memcpy(X.data() + k * H, xb + (size_t)t * H, H * 4);
+        }
+        bool ok = true;
+#ifdef NEXUS_VULKAN
+        if (card) {
+            ok = card->mat_mat(j.gate, X.data(), G.data(), F, H, m, j.gate_t) && card->mat_mat(j.up, X.data(), U.data(), F, H, m, j.up_t);
+            if (ok) { for (size_t k = 0; k < m; ++k) { cpu::silu(G.data() + k * F, F); cpu::mul(G.data() + k * F, U.data() + k * F, G.data() + k * F, F); } }
+            ok = ok && card->mat_mat(j.down, G.data(), D.data(), H, F, m, j.down_t);
+            if (evict_after) for (const void* p : { j.gate, j.up, j.down }) { card->unpin_weight_public(p); card->evict_weight_public(p); }
+        } else
+#endif
+        {
+            cpu::mat_mat(j.gate, X.data(), G.data(), F, H, m, j.gate_t, n_threads_);
+            cpu::mat_mat(j.up,   X.data(), U.data(), F, H, m, j.up_t,   n_threads_);
+            for (size_t k = 0; k < m; ++k) { cpu::silu(G.data() + k * F, F); cpu::mul(G.data() + k * F, U.data() + k * F, G.data() + k * F, F); }
+            cpu::mat_mat(j.down, G.data(), D.data(), H, F, m, j.down_t, n_threads_);
+        }
+        if (!ok) return false;
+        for (size_t k = 0; k < m; ++k) memcpy(res.data() + (size_t)sl[k] * H, D.data() + k * H, H * 4);
+        return true;
+    };
+    std::vector<std::future<std::vector<int>>> fut(nc + 1);   // each returns the experts it could NOT do
+    for (size_t c = 0; c <= nc; ++c) {
+        if (card_list[c].empty()) continue;
+        gpu::VulkanBackend* card = c < nc ? moe_cards_[c] : pcard;
+        fut[c] = std::async(std::launch::async, [&, c, card]() {
+            std::vector<int> failed;
+            for (const auto& es : card_list[c]) if (!run_expert(es.first, card, es.second)) failed.push_back(es.first);
+            return failed;
+        });
+    }
+    for (int e : cpu_list) run_expert(e, nullptr, false);
+    int on_card = 0, streamed = 0, fell_back = 0;
+    for (size_t c = 0; c <= nc; ++c) {
+        if (!fut[c].valid()) continue;
+        const std::vector<int> failed = fut[c].get();
+        for (int e : failed) run_expert(e, nullptr, false);
+        fell_back += (int)failed.size();
+        for (const auto& es : card_list[c])
+            if (std::find(failed.begin(), failed.end(), es.first) == failed.end()) (es.second ? streamed : on_card) += 1;
+    }
+    // 4. sum per token, in rank order, shared last
+    std::vector<float> shw((size_t)n, 1.0f);
+    if (shared && lw.wgate_inp_shexp)
+        for (int t = 0; t < n; ++t) {
+            float dot = 0.0f; const float* xt = xb + (size_t)t * H;
+            for (int i = 0; i < hidden; ++i) dot += xt[i] * lw.wgate_inp_shexp[i];
+            shw[(size_t)t] = dot > 80.0f ? 1.0f : dot < -80.0f ? 0.0f : 1.0f / (1.0f + expf(-dot));
+        }
+    nx_par_range(n, n_threads_, [&](int a, int b) {
+        for (int t = a; t < b; ++t) {
+            float* o = out + (size_t)t * H;
+            std::fill(o, o + H, 0.0f);
+            for (int j = 0; j < top_k; ++j) {
+                const float w = wt[(size_t)t * top_k + j];
+                if (w == 0.0f) continue;
+                const float* r = res.data() + ((size_t)t * top_k + j) * H;
+                for (size_t k = 0; k < H; ++k) o[k] += w * r[k];
+            }
+            if (shared) { const float w = shw[(size_t)t]; const float* r = res.data() + ((size_t)n * top_k + t) * H; for (size_t k = 0; k < H; ++k) o[k] += w * r[k]; }
+        }
+    });
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 6 || std::getenv("NEXUS_MOE_PREFILL_LOG")) {
+        fprintf(stderr, "[moe:prompt] L=%d %d tokens: experts used %d -- %d on the cards that hold them, %d streamed through the prompt card, %d on the CPU%s\n",
+                layer_idx, n, (int)(cpu_list.size()) + on_card + streamed + fell_back, on_card, streamed, (int)cpu_list.size() + fell_back,
+                fell_back ? " (some fell back: a card said no)" : "");
+        fflush(stderr);
+    }
+    return true;
+}
+
 inline void Transformer::forward_dense_ffn_batch(const TransformerLayerWeights& lw,
                                                  const float* xb_batch,
                                                  float* out_batch,
@@ -7135,6 +7764,16 @@ inline void Transformer::forward_dense_ffn_batch(const TransformerLayerWeights& 
 {
     const int hidden = (int)meta_.hidden_dim;
     const int ffn = (int)meta_.ffn_dim;
+    if (lw.moe && xb_batch && out_batch && n_tokens > 0) {
+        // the layer functions only call this for a MoE layer after moe_batch_ok() said yes
+        if (forward_moe_ffn_batch(lw, xb_batch, out_batch, layer_idx, n_tokens)) return;
+        for (int t = 0; t < n_tokens; ++t) {            // can't happen (checked before), but never leave garbage
+            float* o = out_batch + (size_t)t * (size_t)hidden;
+            memcpy(o, xb_batch + (size_t)t * (size_t)hidden, (size_t)hidden * sizeof(float));
+            forward_ffn(lw, o);
+        }
+        return;
+    }
     if (!xb_batch || !out_batch || n_tokens <= 0 || hidden <= 0 || ffn <= 0 || lw.moe) {
         if (out_batch && n_tokens > 0 && hidden > 0)
             std::memset(out_batch, 0, (size_t)n_tokens * (size_t)hidden * sizeof(float));
@@ -7219,7 +7858,7 @@ inline bool Transformer::forward_qwen35_prefill_layer_batch(const TransformerLay
                                                             int n_tokens)
 {
     const int hidden = (int)meta_.hidden_dim;
-    if (!lw.qwen35_linear || lw.moe || !x_batch || n_tokens <= 1 || hidden <= 0)
+    if (!lw.qwen35_linear || (lw.moe && !moe_batch_ok(lw)) || !x_batch || n_tokens <= 1 || hidden <= 0)
         return false;
 
     // IMPORTANT: turbo prefill is layer-major over the FULL prompt.
@@ -7337,7 +7976,7 @@ inline bool Transformer::forward_full_attn_prefill_layer_batch_native_legacy(
     if (!x_batch || n_tokens <= 1 || hidden <= 0) return false;
 
     // Plain + Qwen3.5 gated softmax attention only. Exotic paths -> per-token.
-    if (lw.qwen35_linear || lw.moe) return false;
+    if (lw.qwen35_linear || (lw.moe && !moe_batch_ok(lw))) return false;
     if (lw.kv_donor_layer >= 0)     return false;   // Gemma4 shared KV
     if (lw.gemma4_tied_kv)          return false;
     // Gate form we handle: query+gate packed into wq (qwen35_full_attn_q_has_gate).
@@ -7660,7 +8299,7 @@ inline bool Transformer::forward_full_attn_prefill_layer_batch(
     if (!x_batch || n_tokens <= 1 || hidden <= 0) return false;
 
     // Plain + Qwen3.5 gated softmax attention only. Exotic paths -> per-token.
-    if (lw.qwen35_linear || lw.moe) return false;
+    if (lw.qwen35_linear || (lw.moe && !moe_batch_ok(lw))) return false;
     if (lw.kv_donor_layer >= 0)     return false;   // Gemma4 shared KV
     if (lw.gemma4_tied_kv)          return false;
     // Gate form we handle: query+gate packed into wq (qwen35_full_attn_q_has_gate).
@@ -8440,7 +9079,7 @@ inline void Transformer::forward_qwen35_linear(
     const float scale = 1.0f / sqrtf((float)hd);
 
     for (int hv_i = 0; hv_i < vh; ++hv_i) {
-        const int hk = hv_i / repeat;
+        const int hk = q35_v_tiled_ ? hv_i % (vh / repeat) : hv_i / repeat;     // tiled: llama.cpp GGUF
 
         const float* q = q_normed.data() + (size_t)hk * hd;
         const float* k = k_normed.data() + (size_t)hk * hd;
@@ -8571,16 +9210,41 @@ inline bool Transformer::q35_gpu_linear_step(const TransformerLayerWeights& lw, 
 {
 #ifdef NEXUS_VULKAN
     static const bool off = [] { const char* e = std::getenv("NEXUS_Q35_GPU_LAYER"); return e && e[0] == '0'; }();
-    static const bool allow_nq = [] { const char* e = std::getenv("NEXUS_Q35_GPU_LAYER_NQ"); return e && e[0] == '1'; }();
-    if (off || !lw.qwen35_linear || !lw.gpu_layer || lw.moe || lw.fused_gate_up || lw.q35_ba) return false;
-    if (lw.attn_norm_zc || lw.ffn_norm_zc || lw.attn_norm_bias || lw.ffn_norm_bias || ffn_activation_gelu_) return false;
-    if (!lw.attn_norm || !lw.ffn_norm || !lw.q35_qkv || !lw.q35_z || !lw.q35_a || !lw.q35_b || !lw.q35_out ||
-        !lw.wgate || !lw.wup || !lw.wdown || !lw.q35_conv || !lw.q35_A || !lw.q35_dt || !lw.q35_norm) return false;
-    gpu::VulkanBackend& g = gpu::gpu();
-    if (!g.ready()) return false;
+    static const bool allow_nq = [] { const char* e = std::getenv("NEXUS_Q35_GPU_LAYER_NQ"); return !(e && e[0] == '0'); }();
+    // Why a layer meant for the card did not take this path -- said once per layer, so nobody has to guess why a
+    // Qwen 3.5 model is running on the CPU with its weights sitting on the card.
+    auto refuse = [&](const char* why) {
+        if ((int)q35_gpu_said_.size() <= l) q35_gpu_said_.resize((size_t)meta_.n_layers, 0);
+        if (l >= 0 && l < (int)q35_gpu_said_.size() && !q35_gpu_said_[(size_t)l]) {
+            q35_gpu_said_[(size_t)l] = 1;
+            fprintf(stderr, "[nexus] layer %d (linear attention) runs on the CPU although it is on the card: %s\n", l, why);
+            fflush(stderr);
+        }
+        dec_mark(l, false, why);
+        return false;
+    };
+    if (off || !lw.qwen35_linear) { dec_mark(l, false, off ? "the whole-layer card path is turned off (NEXUS_Q35_GPU_LAYER=0)" : nullptr); return false; }
+    gpu::VulkanBackend* card = layer_card(lw);          // the first, second, third ... card -- whichever holds this layer
+    // These two used to return without a word, which is how a model can sit on two full cards and still run on the CPU.
+    if (!card) { dec_mark(l, false, (lw.gpu_layer || lw.gpu2_layer || lw.gpux >= 0) ? "no card object for it (card flags and cards disagree)" : nullptr); return false; }
+    // A mixture-of-experts layer: the attention half runs here (one submit), the experts run in forward_ffn -- on the cards
+    // that hold them (moe_place) and on the CPU for the rest. Never chained: the experts need the hidden state right away.
+    const bool moe = lw.moe;
+    if (moe && async) { dec_mark(l, false, nullptr); return false; }
+    if (moe && !moe_attn_on_card()) return refuse("mixture of experts, and its attention-on-the-card path is turned off (NEXUS_MOE_ATTN_GPU=0)");
+    if (!moe && lw.fused_gate_up) return refuse("its gate and up matrices are one fused tensor");
+    if (lw.q35_ba) return refuse("its beta and alpha are one fused tensor (ssm_beta_alpha)");
+    if (lw.attn_norm_zc || lw.ffn_norm_zc) return refuse("zero-centred norm weights (1 + w)");
+    if (lw.attn_norm_bias || lw.ffn_norm_bias) return refuse("its norms have biases");
+    if (ffn_activation_gelu_) return refuse("GELU feed-forward");
+    if (!lw.attn_norm || !lw.q35_qkv || !lw.q35_z || !lw.q35_a || !lw.q35_b || !lw.q35_out ||
+        (!moe && (!lw.ffn_norm || !lw.wgate || !lw.wup || !lw.wdown)) || !lw.q35_conv || !lw.q35_A || !lw.q35_dt || !lw.q35_norm) return refuse("a weight of this layer is missing");
+    gpu::VulkanBackend& g = *card;
+    if (!g.ready()) return refuse("its card is not ready (the backend never came up, or it was reset)");
     if (!allow_nq) {
         for (QuantType t : { lw.q35_qkv_type, lw.q35_z_type, lw.q35_a_type, lw.q35_b_type, lw.q35_out_type, lw.wgate_type, lw.wup_type, lw.wdown_type })
-            if (t == QuantType::NQ4_G64 || t == QuantType::NQ5_G64 || t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64) return false;
+            if (t == QuantType::NQ4_G64 || t == QuantType::NQ5_G64 || t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64)
+                return refuse("Nexus native quant weights (NQ*_G64) turned off here by NEXUS_Q35_GPU_LAYER_NQ=0");
     }
     const int n_layers = (int)meta_.n_layers;
     if ((int)q35_conv_state_.size() < n_layers) q35_conv_state_.resize(n_layers);
@@ -8602,14 +9266,51 @@ inline bool Transformer::q35_gpu_linear_step(const TransformerLayerWeights& lw, 
     d.conv_w = lw.q35_conv; d.A = lw.q35_A; d.dt = lw.q35_dt; d.gnorm = lw.q35_norm;
     d.out = lw.q35_out; d.out_t = lw.q35_out_type;
     d.gate = lw.wgate; d.gate_t = lw.wgate_type; d.up = lw.wup; d.up_t = lw.wup_type; d.down = lw.wdown; d.down_t = lw.wdown_type;
+    if (moe) { d.attn_only = true; d.gate = d.up = d.down = nullptr; d.ffn = 0; }
+    // No BF16 kernel on the card: widen, don't give up the layer. a and b are the two that do this on Qwen 3.5.
+    bf16widen(d.qkv, d.qkv_t, d.conv_dim, d.hidden);  bf16widen(d.z, d.z_t, d.value_dim, d.hidden);
+    bf16widen(d.a, d.a_t, d.vh, d.hidden);            bf16widen(d.b, d.b_t, d.vh, d.hidden);
+    bf16widen(d.out, d.out_t, d.hidden, d.value_dim);
+    if (!moe) {
+        bf16widen(d.gate, d.gate_t, d.ffn, d.hidden);     bf16widen(d.up, d.up_t, d.ffn, d.hidden);
+        bf16widen(d.down, d.down_t, d.hidden, d.ffn);
+    }
     q8swap(d.qkv, d.qkv_t, d.conv_dim, d.hidden); q8swap(d.z, d.z_t, d.value_dim, d.hidden);
-    q8swap(d.gate, d.gate_t, d.ffn, d.hidden); q8swap(d.up, d.up_t, d.ffn, d.hidden);
-    if (!g.q35_linear_layer(d, x, q35_conv_state_[l].data(), q35_recurrent_state_[l].data(), async)) return false;
+    if (!moe) { q8swap(d.gate, d.gate_t, d.ffn, d.hidden); q8swap(d.up, d.up_t, d.ffn, d.hidden); }
+    g.set_q35_v_tiled(q35_v_tiled_);
+    if (!g.q35_linear_layer(d, x, q35_conv_state_[l].data(), q35_recurrent_state_[l].data(), async))
+        return refuse("the card's whole-layer kernel would not run it");
     q35_dev_ahead_[l] = 1;
+    dec_mark(l, true, nullptr);
     return true;
 #else
     (void)lw; (void)l; (void)x; (void)async; return false;
 #endif
+}
+
+// BF16 -> F32, once per tensor, kept for the rest of the run. Exact: a BF16 value IS the top 16 bits of the float.
+inline void Transformer::bf16widen(const void*& w, QuantType& t, size_t rows, size_t cols)
+{
+    static const bool off = [] { const char* e = std::getenv("NEXUS_BF16_WIDEN"); return e && e[0] == '0'; }();
+    if (off || t != QuantType::BF16 || !w || rows == 0 || cols == 0) return;
+    auto it = bf16wide_.find(w);
+    if (it == bf16wide_.end()) {
+        const size_t n = rows * cols;
+        std::vector<float> out(n);
+        const uint16_t* src = (const uint16_t*)w;
+        for (size_t i = 0; i < n; ++i) { const uint32_t bits = (uint32_t)src[i] << 16; std::memcpy(&out[i], &bits, sizeof(float)); }
+        bf16wide_bytes_ += out.size() * sizeof(float);
+        static int said = 0;
+        if (++said == 1)
+            fprintf(stderr, "[nexus] BF16 weights widened to F32 for the card (it has no BF16 kernel; without this the whole layer "
+                            "runs on the CPU)\n");
+        if (said == 1 || said % 24 == 0)
+            fprintf(stderr, "[nexus] BF16 -> F32: %d tensors, %zu MB\n", said, bf16wide_bytes_ >> 20);
+        it = bf16wide_.emplace(w, std::move(out)).first;
+        fflush(stderr);
+    }
+    w = it->second.data();
+    t = QuantType::F32;
 }
 
 inline void Transformer::q8swap(const void*& w, QuantType& t, size_t rows, size_t cols)
@@ -8660,40 +9361,47 @@ inline bool Transformer::q35_gpu_full_step(const TransformerLayerWeights& lw, in
 {
 #ifdef NEXUS_VULKAN
     static const bool off = [] { const char* e = std::getenv("NEXUS_Q35_GPU_ATTN"); return e && e[0] == '0'; }();
-    static const bool allow_nq = [] { const char* e = std::getenv("NEXUS_Q35_GPU_LAYER_NQ"); return e && e[0] == '1'; }();
+    static const bool allow_nq = [] { const char* e = std::getenv("NEXUS_Q35_GPU_LAYER_NQ"); return !(e && e[0] == '0'); }();
     static const bool qgate_ok = [] { const char* e = std::getenv("NEXUS_QWEN35_QGATE_LAYOUT"); return !e || !*e || std::strcmp(e, "perhead") == 0; }();
     // Qwen3.5 gated layers, and ordinary attention layers of architectures whose layer is exactly
     // norm -> q/k/v (+bias) -> [q/k head norm] -> RoPE -> softmax attention -> o (+bias) -> residual -> norm -> SwiGLU -> residual.
     const bool gated = lw.qwen35_full_attn_q_has_gate;
-    if (off || lw.qwen35_linear || !lw.gpu_layer || lw.moe || lw.fused_gate_up || lw.fused_qkv) return gpu::nx_decline("linear-attention / MoE / fused-weight layer, not on the GPU, or NEXUS_Q35_GPU_ATTN=0");
-    if (gated && !qgate_ok) return gpu::nx_decline("NEXUS_QWEN35_QGATE_LAYOUT is not perhead");
-    if (!gated && !plain_attn_gpu_ok()) return gpu::nx_decline("architecture not on the plain-attention GPU list (NEXUS_GPU_LAYER_ANY=1 to try it anyway)");
-    if (lw.kv_donor_layer >= 0 || lw.gemma4_tied_kv || lw.attn_gate) return gpu::nx_decline("lw.kv_donor_layer >= 0 || lw.gemma4_tied_kv || lw.attn_gate");
-    if (lw.attn_norm_zc || lw.ffn_norm_zc || lw.attn_norm_bias || lw.ffn_norm_bias || ffn_activation_gelu_) return gpu::nx_decline("lw.attn_norm_zc || lw.ffn_norm_zc || lw.attn_norm_bias || lw.ffn_norm_bias || ffn_activation_gelu_");
-    if (lw.attn_post_norm || lw.ffn_post_norm || lw.layer_output_scale || lw.ple_layer_index >= 0) return gpu::nx_decline("lw.attn_post_norm || lw.ffn_post_norm || lw.layer_output_scale || lw.ple_layer_index >= 0");
-    if (!lw.attn_norm || !lw.ffn_norm || !lw.wq || !lw.wk || !lw.wv || !lw.wo || !lw.wgate || !lw.wup || !lw.wdown) return gpu::nx_decline("!lw.attn_norm || !lw.ffn_norm || !lw.wq || !lw.wk || !lw.wv || !lw.wo || !lw.wgate || !lw.wup || !lw.wdown");
-    if (gated && (!lw.attn_q_norm || !lw.attn_k_norm)) return gpu::nx_decline("gated layer without q/k norm");
+    // every "no" is recorded against the layer, so the placement report can say why the CPU ran it
+    auto decline = [&](const char* why) { dec_mark(l, false, why); return gpu::nx_decline(why); };
+    gpu::VulkanBackend* card = layer_card(lw);          // the first, second, third ... card -- whichever holds this layer
+    if (!card) { dec_mark(l, false, (lw.gpu_layer || lw.gpu2_layer || lw.gpux >= 0) ? "no card object for it (card flags and cards disagree)" : nullptr); return false; }
+    const bool moe = lw.moe;                            // attention on the card, experts in forward_ffn (see the linear step)
+    if (moe && async) { dec_mark(l, false, nullptr); return false; }
+    if (moe && !moe_attn_on_card()) return decline("mixture of experts, and its attention-on-the-card path is turned off (NEXUS_MOE_ATTN_GPU=0)");
+    if (off || lw.qwen35_linear || (!moe && lw.fused_gate_up) || lw.fused_qkv) return decline("linear-attention / fused-weight layer, not on the GPU, or NEXUS_Q35_GPU_ATTN=0");
+    if (gated && !qgate_ok) return decline("NEXUS_QWEN35_QGATE_LAYOUT is not perhead");
+    if (!gated && !plain_attn_gpu_ok()) return decline("architecture not on the plain-attention GPU list (NEXUS_GPU_LAYER_ANY=1 to try it anyway)");
+    if (lw.kv_donor_layer >= 0 || lw.gemma4_tied_kv || lw.attn_gate) return decline("it shares another layer's keys and values, or has an attention gate");
+    if (lw.attn_norm_zc || lw.ffn_norm_zc || lw.attn_norm_bias || lw.ffn_norm_bias || ffn_activation_gelu_) return decline("zero-centred norm weights, norm biases or a GELU feed-forward");
+    if (lw.attn_post_norm || lw.ffn_post_norm || lw.layer_output_scale || lw.ple_layer_index >= 0) return decline("extra norms, an output scale or per-layer embeddings");
+    if (!lw.attn_norm || !lw.wq || !lw.wk || !lw.wv || !lw.wo || (!moe && (!lw.ffn_norm || !lw.wgate || !lw.wup || !lw.wdown))) return decline("!lw.attn_norm || !lw.ffn_norm || !lw.wq || !lw.wk || !lw.wv || !lw.wo || !lw.wgate || !lw.wup || !lw.wdown");
+    if (gated && (!lw.attn_q_norm || !lw.attn_k_norm)) return decline("gated layer without q/k norm");
     AttentionConfig cfg = attn_cfg_;
     if (lw.attn_heads_layer > 0)     cfg.n_heads    = lw.attn_heads_layer;
     if (lw.attn_kv_heads_layer > 0)  cfg.n_kv_heads = lw.attn_kv_heads_layer;
     if (lw.attn_head_dim_layer > 0)  cfg.head_dim   = lw.attn_head_dim_layer;
     if (lw.sw_window_size > 0)       cfg.sliding_window = lw.sw_window_size;
     if (lw.rope_freq_base_layer > 0) cfg.rope.freq_base = lw.rope_freq_base_layer;
-    if (cfg.sliding_window != 0 || cfg.attn_softcap != 0.0f) return gpu::nx_decline("cfg.sliding_window != 0 || cfg.attn_softcap != 0.0f");
+    if (cfg.sliding_window != 0 || cfg.attn_softcap != 0.0f) return decline("cfg.sliding_window != 0 || cfg.attn_softcap != 0.0f");
     const int hd = cfg.head_dim, nh = cfg.n_heads, nkv = cfg.n_kv_heads;
-    if (hd <= 0 || nh <= 0 || nkv <= 0) return gpu::nx_decline("hd <= 0 || nh <= 0 || nkv <= 0");
+    if (hd <= 0 || nh <= 0 || nkv <= 0) return decline("hd <= 0 || nh <= 0 || nkv <= 0");
     // head norms must be per head (some models -- OLMo 2 -- normalise the whole q vector instead)
-    if ((lw.attn_q_norm && (int)lw.attn_q_norm_len != hd) || (lw.attn_k_norm && (int)lw.attn_k_norm_len != hd)) return gpu::nx_decline("q/k norm is not per head");
-    if (kvcache_.kv_heads_for_layer(l) != nkv || kvcache_.head_dim_for_layer(l) != hd) return gpu::nx_decline("kvcache_.kv_heads_for_layer(l) != nkv || kvcache_.head_dim_for_layer(l) != hd");
-    if (pos < 0 || kvcache_.n_tokens() < pos) return gpu::nx_decline("pos < 0 || kvcache_.n_tokens() < pos");
+    if ((lw.attn_q_norm && (int)lw.attn_q_norm_len != hd) || (lw.attn_k_norm && (int)lw.attn_k_norm_len != hd)) return decline("q/k norm is not per head");
+    if (kvcache_.kv_heads_for_layer(l) != nkv || kvcache_.head_dim_for_layer(l) != hd) return decline("kvcache_.kv_heads_for_layer(l) != nkv || kvcache_.head_dim_for_layer(l) != hd");
+    if (pos < 0 || kvcache_.n_tokens() < pos) return decline("pos < 0 || kvcache_.n_tokens() < pos");
     int rot = hd;                                                     // ordinary layers rotate the whole head
     if (gated) { rot = hd / 4; if (hd == 256) rot = 64; }            // same partial-RoPE width as nx_apply_rope_qwen35_partial_or_full
-    if (rot <= 0 || rot > hd || (rot & 1)) return gpu::nx_decline("rot <= 0 || rot > hd || (rot & 1)");
-    gpu::VulkanBackend& g = gpu::gpu();
-    if (!g.ready()) return gpu::nx_decline("!g.ready()");
+    if (rot <= 0 || rot > hd || (rot & 1)) return decline("rot <= 0 || rot > hd || (rot & 1)");
+    gpu::VulkanBackend& g = *card;
+    if (!g.ready()) return decline("its card is not ready (the backend never came up, or it was reset)");
     if (!allow_nq) {
         for (QuantType t : { lw.wq_type, lw.wk_type, lw.wv_type, lw.wo_type, lw.wgate_type, lw.wup_type, lw.wdown_type })
-            if (t == QuantType::NQ4_G64 || t == QuantType::NQ5_G64 || t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64) return gpu::nx_decline("t == QuantType::NQ4_G64 || t == QuantType::NQ5_G64 || t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64");
+            if (t == QuantType::NQ4_G64 || t == QuantType::NQ5_G64 || t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64) return decline("Nexus native quant weights (NQ*_G64) turned off here by NEXUS_Q35_GPU_LAYER_NQ=0");
     }
     // cos/sin of this position, produced by the engine's own rope code (rotate_half layout on the first `rot` dims) so every RoPE variant matches the CPU path
     const int rope_pos = rope_effective_position(pos);
@@ -8722,9 +9430,16 @@ inline bool Transformer::q35_gpu_full_step(const TransformerLayerWeights& lw, in
     d.bq = lw.bq; d.bk = lw.bk; d.bv = lw.bv; d.bo = lw.bo;
     d.rope_tab = tab.data();
     d.gate = lw.wgate; d.gate_t = lw.wgate_type; d.up = lw.wup; d.up_t = lw.wup_type; d.down = lw.wdown; d.down_t = lw.wdown_type;
-    q8swap(d.wq, d.wq_t, (size_t)nh * hd * (gated ? 2 : 1), d.hidden); q8swap(d.gate, d.gate_t, d.ffn, d.hidden); q8swap(d.up, d.up_t, d.ffn, d.hidden);
+    if (moe) { d.attn_only = true; d.gate = d.up = d.down = nullptr; d.ffn = 0; }
+    // same as the linear layers: a BF16 weight is widened, not a reason to hand the layer to the CPU
+    bf16widen(d.wq, d.wq_t, (size_t)nh * hd * (gated ? 2 : 1), d.hidden);
+    bf16widen(d.wk, d.wk_t, (size_t)nkv * hd, d.hidden); bf16widen(d.wv, d.wv_t, (size_t)nkv * hd, d.hidden);
+    bf16widen(d.wo, d.wo_t, d.hidden, (size_t)nh * hd);
+    if (!moe) { bf16widen(d.gate, d.gate_t, d.ffn, d.hidden); bf16widen(d.up, d.up_t, d.ffn, d.hidden); bf16widen(d.down, d.down_t, d.hidden, d.ffn); }
+    q8swap(d.wq, d.wq_t, (size_t)nh * hd * (gated ? 2 : 1), d.hidden);
+    if (!moe) { q8swap(d.gate, d.gate_t, d.ffn, d.hidden); q8swap(d.up, d.up_t, d.ffn, d.hidden); }
     const uint16_t* kp[16]; const uint16_t* vp[16];
-    if (nkv > 16) return gpu::nx_decline("nkv > 16");
+    if (nkv > 16) return decline("nkv > 16");
     for (int h = 0; h < nkv; ++h) { kp[h] = kvcache_.k_ptr(l, h); vp[h] = kvcache_.v_ptr(l, h); }
     d.k_host = kp; d.v_host = vp;
     d.host_tokens = (uint32_t)kvcache_.n_tokens();
@@ -8733,13 +9448,15 @@ inline bool Transformer::q35_gpu_full_step(const TransformerLayerWeights& lw, in
     kvo.resize((size_t)2 * nkv * hd);
     uint32_t mirror_valid = 0;
     if (async) {
-        if (q35_chain_kv_.size() >= (size_t)gpu::VulkanBackend::kChainKvSlots) return gpu::nx_decline("q35_chain_kv_.size() >= (size_t)gpu::VulkanBackend::kChainKvSlots");          // ring full: caller flushes, then this layer runs synchronously
+        if (q35_chain_kv_.size() >= (size_t)gpu::VulkanBackend::kChainKvSlots) return decline("q35_chain_kv_.size() >= (size_t)gpu::VulkanBackend::kChainKvSlots");          // ring full: caller flushes, then this layer runs synchronously
         const int slot = (int)q35_chain_kv_.size();
-        if (!g.q35_full_layer(d, x, nullptr, &mirror_valid, slot)) return gpu::nx_decline("!g.q35_full_layer(d, x, nullptr, &mirror_valid, slot)");
-        q35_chain_kv_.push_back({l, pos, nkv, hd, mirror_valid, slot});                                // host store happens in q35_chain_flush()
+        if (!g.q35_full_layer(d, x, nullptr, &mirror_valid, slot)) return decline("the card's whole-layer kernel would not run it (chained)");
+        dec_mark(l, true, nullptr);
+        q35_chain_kv_.push_back({l, pos, nkv, hd, mirror_valid, slot, (void*)&g});                                // host store happens in q35_chain_flush()
         return true;
     }
-    if (!g.q35_full_layer(d, x, kvo.data(), &mirror_valid)) return gpu::nx_decline("!g.q35_full_layer(d, x, kvo.data(), &mirror_valid)");
+    if (!g.q35_full_layer(d, x, kvo.data(), &mirror_valid)) return decline("the card's whole-layer kernel would not run it (no room for its conversation mirror is the usual cause)");
+    dec_mark(l, true, nullptr);
     kvcache_.store(l, pos, kvo.data(), kvo.data() + (size_t)nkv * hd, nkv * hd);     // host cache stays the source of truth (sessions, CPU fallback, MTP)
     kvcache_.set_mirror_valid(l, mirror_valid);
     return true;
@@ -8748,12 +9465,629 @@ inline bool Transformer::q35_gpu_full_step(const TransformerLayerWeights& lw, in
 #endif
 }
 
+// ======================================================================================================================
+// Mixture-of-experts: experts on the cards (see the members' comment for the two modes)
+// ======================================================================================================================
+inline int Transformer::moe_mode_now() {
+    if (moe_mode_ < 0) {
+        moe_mode_ = 2;                                             // default: prompt-picked
+        if (const char* e = std::getenv("NEXUS_MOE_EXPERTS")) {
+            if (!std::strcmp(e, "off") || !std::strcmp(e, "0")) moe_mode_ = 0;
+            else if (!std::strcmp(e, "home") || !std::strcmp(e, "1")) moe_mode_ = 1;
+            else moe_mode_ = 2;
+        }
+    }
+    return moe_mode_;
+}
+inline int Transformer::moe_home_now() {
+    if (moe_home_n_ == -2) {
+        moe_home_n_ = -1;
+        if (const char* e = std::getenv("NEXUS_MOE_HOME")) moe_home_n_ = (!std::strcmp(e, "all") || !*e) ? -1 : std::max(0, std::atoi(e));
+    }
+    return moe_home_n_;
+}
+
+// The three matrices of expert e (e == expert count: the shared expert). False when the layout is one this path doesn't do
+// (gate and up fused into one tensor, transposed storage, per-expert tensors) -- those experts simply stay on the CPU.
+inline bool Transformer::moe_expert_job(const TransformerLayerWeights& lw, int e, gpu::VulkanBackend::MoeJob& j) const {
+    const int n_exp = (int)lw.moe_expert_count;
+    if (!lw.moe || e < 0 || e > n_exp) return false;
+    if (e == n_exp) {
+        if (!lw.moe_has_shared || !lw.wgate_shexp || !lw.wup_shexp || !lw.wdown_shexp) return false;
+        if (lw.moe_shared_gate_transposed || lw.moe_shared_up_transposed || lw.moe_shared_down_transposed) return false;
+        const uint32_t sf = (uint32_t)lw.moe_shared_ffn_dim;
+        if (!sf || lw.moe_shared_gate_rows != sf || lw.moe_shared_up_rows != sf || lw.moe_shared_down_cols != sf ||
+            lw.moe_shared_gate_cols != meta_.hidden_dim || lw.moe_shared_down_rows != meta_.hidden_dim) return false;
+        j.gate = lw.wgate_shexp; j.gate_t = lw.wgate_shexp_type; j.up = lw.wup_shexp; j.up_t = lw.wup_shexp_type;
+        j.down = lw.wdown_shexp; j.down_t = lw.wdown_shexp_type; j.ffn = sf;
+        return true;
+    }
+    if (lw.moe_fused_gate_up || lw.moe_split_experts || lw.moe_gate_transposed || lw.moe_up_transposed || lw.moe_down_transposed) return false;
+    if (!lw.wgate_exps || !lw.wup_exps || !lw.wdown_exps) return false;
+    const uint32_t f = (uint32_t)lw.moe_ffn_dim;
+    if (!f || lw.moe_gate_rows != f || lw.moe_up_rows != f || lw.moe_down_cols != f ||
+        lw.moe_gate_cols != meta_.hidden_dim || lw.moe_down_rows != meta_.hidden_dim) return false;
+    j.gate = (const uint8_t*)lw.wgate_exps + (size_t)e * lw.wgate_exps_stride; j.gate_t = lw.wgate_exps_type;
+    j.up   = (const uint8_t*)lw.wup_exps   + (size_t)e * lw.wup_exps_stride;   j.up_t   = lw.wup_exps_type;
+    j.down = (const uint8_t*)lw.wdown_exps + (size_t)e * lw.wdown_exps_stride; j.down_t = lw.wdown_exps_type;
+    j.ffn = f;
+    return true;
+}
+
+// Bytes the expert takes on this card; 0 = the card has no kernel for one of its types (it stays on the CPU).
+inline size_t Transformer::moe_job_bytes(gpu::VulkanBackend& c, const gpu::VulkanBackend::MoeJob& j) const {
+#ifdef NEXUS_VULKAN
+    auto ok_type = [](QuantType t) {
+        switch (t) {
+            case QuantType::Q8_0: case QuantType::Q4_K: case QuantType::Q5_K: case QuantType::Q6_K: case QuantType::Q2_K: case QuantType::Q3_K:
+            case QuantType::NQ4_G64: case QuantType::NQ5_G64: case QuantType::NQ6_G64: case QuantType::NQ8_G64: return true;
+            default: return false;
+        }
+    };
+    const size_t h = (size_t)meta_.hidden_dim;
+    const struct { QuantType t; size_t r, c; } m[3] = { {j.gate_t, j.ffn, h}, {j.up_t, j.ffn, h}, {j.down_t, h, j.ffn} };
+    size_t total = 0;
+    for (auto& w : m) {
+        size_t b = 0; uint32_t nb = 0;
+        if (!ok_type(w.t) || !c.size_for_public(w.t, w.r, w.c, b, nb) || !b) return 0;
+        total += b;
+    }
+    return total;
+#else
+    (void)c; (void)j; return 0;
+#endif
+}
+
+inline bool Transformer::moe_in_experts(const TransformerLayerWeights& lw, const void* p) const {
+    if (!lw.moe || !p) return false;
+    const uint8_t* q = (const uint8_t*)p;
+    auto in = [&](const void* b, size_t stride) { return b && stride && q >= (const uint8_t*)b && q < (const uint8_t*)b + stride * lw.moe_expert_count; };
+    return in(lw.wgate_exps, lw.wgate_exps_stride) || in(lw.wup_exps, lw.wup_exps_stride) || in(lw.wdown_exps, lw.wdown_exps_stride);
+}
+
+// Experts are computed on the CPU (and only copied to a card), so they must be in RAM even when their layer is "on a card"
+// -- a card layer otherwise keeps no RAM copy and parking would drop them. Copies them in once (normal loading).
+inline void Transformer::moe_keep_experts_in_ram() {
+#ifndef _WIN32
+    size_t bytes = 0; int n = 0;
+    for (auto& r : gguf::nx_direct_ranges()) {
+        if (r.layer < 0 || r.layer >= (int)layer_weights_.size() || !moe_in_experts(layer_weights_[(size_t)r.layer], r.p)) continue;
+        const uintptr_t b = (uintptr_t)r.p, e = b + r.n;
+        for (uintptr_t a = b & ~(uintptr_t)4095; a < e; a += 4096) { volatile uint8_t* q = (volatile uint8_t*)(a < b ? b : a); *q = *q; }
+        bytes += r.n; ++n; r.layer = -2;
+    }
+    if (n) { fprintf(stderr, "[moe] %d expert tensors (%zu MB) kept in RAM: the CPU computes the experts that are not on a card\n", n, bytes >> 20); fflush(stderr); }
+#endif
+}
+
+inline bool Transformer::moe_load(int l, int e, int ci) {
+#ifdef NEXUS_VULKAN
+    gpu::VulkanBackend::MoeJob j{};
+    if (ci < 0 || ci >= (int)moe_cards_.size() || !moe_expert_job(layer_weights_[(size_t)l], e, j)) return false;
+    gpu::VulkanBackend& c = *moe_cards_[(size_t)ci];
+    const size_t need = moe_job_bytes(c, j);
+    if (!need || moe_held_[(size_t)ci] + need > moe_cap_[(size_t)ci]) return false;
+    const size_t h = (size_t)meta_.hidden_dim;
+    const struct { const void* p; QuantType t; size_t r, c; } m[3] = { {j.gate, j.gate_t, j.ffn, h}, {j.up, j.up_t, j.ffn, h}, {j.down, j.down_t, h, j.ffn} };
+    int done = 0;
+    for (auto& w : m) {
+        size_t b = 0; uint32_t nb = 0;
+        if (!c.size_for_public(w.t, w.r, w.c, b, nb) || !c.load_weight_force_public(w.p, b, w.t, true)) break;
+        ++done;
+    }
+    if (done < 3) {
+        for (int i = 0; i < done; ++i) { c.unpin_weight_public(m[i].p); c.evict_weight_public(m[i].p); }
+        moe_cap_[(size_t)ci] = moe_held_[(size_t)ci];          // the card said no: treat it as full from here on
+        return false;
+    }
+    moe_held_[(size_t)ci] += need;
+    moe_res_[(size_t)l][(size_t)e] = (int8_t)ci;
+    moe_layer_on_card_[(size_t)l] = 1;
+    return true;
+#else
+    (void)l; (void)e; (void)ci; return false;
+#endif
+}
+
+inline void Transformer::moe_unload(int l, int e) {
+#ifdef NEXUS_VULKAN
+    const int ci = moe_res_[(size_t)l][(size_t)e];
+    gpu::VulkanBackend::MoeJob j{};
+    if (ci < 0 || !moe_expert_job(layer_weights_[(size_t)l], e, j)) return;
+    gpu::VulkanBackend& c = *moe_cards_[(size_t)ci];
+    const size_t b = moe_job_bytes(c, j);
+    for (const void* p : { j.gate, j.up, j.down }) { c.unpin_weight_public(p); c.evict_weight_public(p); }
+    moe_held_[(size_t)ci] -= std::min(moe_held_[(size_t)ci], b);
+    moe_res_[(size_t)l][(size_t)e] = -1;
+    bool any = false;
+    for (int8_t v : moe_res_[(size_t)l]) any = any || v >= 0;
+    moe_layer_on_card_[(size_t)l] = any;
+#else
+    (void)l; (void)e;
+#endif
+}
+
+// Before a prompt is read with parking on: the parking card's experts step aside (unpinned and freed), so the prompt has the
+// room parking promised it. moe_rebalance puts them back (home) or picks again (prompt-picked) right after the prompt.
+inline void Transformer::moe_clear_card(int ci) {
+    if (ci < 0 || ci >= (int)moe_cards_.size()) return;
+    int n = 0;
+    for (int l = 0; l < (int)moe_res_.size(); ++l)
+        for (int e = 0; e < (int)moe_res_[(size_t)l].size(); ++e)
+            if (moe_res_[(size_t)l][(size_t)e] == ci) { moe_unload(l, e); moe_aside_.push_back({l, e}); ++n; }
+    if (n) moe_due_ = true;
+}
+
+// Once, after every card has its layers and the lm_head: which cards take experts, how much room each has, and the first
+// fill (home: the fixed set; prompt-picked: an even spread until the first prompt says which ones matter).
+inline void Transformer::moe_place() {
+#ifdef NEXUS_VULKAN
+    if (moe_placed_) return;
+    moe_placed_ = true;
+    const int nl = (int)layer_weights_.size();
+    bool any_moe = false;
+    for (const auto& lw : layer_weights_) any_moe = any_moe || lw.moe;
+    if (!any_moe) return;
+    moe_res_.assign((size_t)nl, {}); moe_use_.assign((size_t)nl, {}); moe_layer_on_card_.assign((size_t)nl, 0);
+    for (int l = 0; l < nl; ++l) {
+        const auto& lw = layer_weights_[(size_t)l];
+        if (!lw.moe) continue;
+        moe_res_[(size_t)l].assign((size_t)lw.moe_expert_count + 1, -1);
+        moe_use_[(size_t)l].assign((size_t)lw.moe_expert_count + 1, 0.0f);
+    }
+    const int mode = moe_mode_now();
+    const char* mname = mode == 0 ? "off" : mode == 1 ? "home" : "prompt";
+    if (mode == 0) { fprintf(stderr, "[moe] experts: CPU only (--moe-experts off)\n"); fflush(stderr); return; }
+
+    // cards: every card that is up, fastest first. The parking card (Maximize GPU) too: its experts step aside while a prompt
+    // is read (parking owns that card's room then) and come back right after it.
+    std::vector<gpu::VulkanBackend*> cards = all_cards();
+    std::stable_sort(cards.begin(), cards.end(), [&](gpu::VulkanBackend* a, gpu::VulkanBackend* b) { return card_read_gbps(*a) > card_read_gbps(*b); });
+    const size_t q_dim = (size_t)(meta_.n_heads * meta_.head_dim), kv_dim = (size_t)(meta_.n_kv_heads * meta_.head_dim);
+    std::string where;
+    for (gpu::VulkanBackend* c : cards) {
+        if (!c->act_bufs_ok()) c->init_activation_bufs(meta_.hidden_dim, q_dim, kv_dim, meta_.ffn_dim);   // the experts' input buffer
+        if (!c->act_bufs_ok()) continue;
+        size_t free_now = 0;
+        if (!c->vram_free_now(free_now) || free_now == 0)
+            free_now = (size_t)c->info().vram_bytes > c->weight_cache_used() ? (size_t)c->info().vram_bytes - c->weight_cache_used() : 0;
+        if (const size_t fake = nx_fake_vram_free_mb()) free_now = fake << 20;
+        const size_t keep = card_keep_bytes(free_now);
+        // the experts' working buffers: 64 jobs x (2 x ffn + hidden) floats, a few MB
+        const size_t work = (size_t)gpu::VulkanBackend::kMoeMaxJobs * ((size_t)meta_.hidden_dim + 2u * 4096u) * 4u;
+        size_t room = free_now > keep + work ? free_now - keep - work : 0;
+        static const size_t cap_kb = [] { const char* e = std::getenv("NEXUS_MOE_CAP_KB"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)0; }();   // testing
+        if (cap_kb) room = std::min(room, cap_kb << 10);
+        else if (room < (16ull << 20)) room = 0;
+        if (room == 0) {
+            fprintf(stderr, "[moe] %s: no room for experts (%zu MB free, %zu MB kept free)\n", c->info().device_name.c_str(), free_now >> 20, keep >> 20);
+            continue;
+        }
+        if (const size_t bud = c->weight_cache_budget()) c->set_weight_cache_budget(std::max<size_t>(bud, c->weight_cache_used() + room + (32ull << 20)));
+        if (c == &gpu::gpu() && park_on_) moe_park_ci_ = (int)moe_cards_.size();
+        moe_cards_.push_back(c); moe_cap_.push_back(room); moe_held_.push_back(0);
+        char b[200]; snprintf(b, sizeof b, "%s%s %zu MB", where.empty() ? "" : ", ", c->info().device_name.c_str(), room >> 20);
+        where += b;
+    }
+    if (moe_cards_.empty()) {
+        fprintf(stderr, "[moe] experts: CPU only -- no card has room for them (--moe-experts %s)\n", mname);
+        fflush(stderr); return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    auto put = [&](int l, int e) -> bool {                        // first card with room
+        for (int ci = 0; ci < (int)moe_cards_.size(); ++ci) if (moe_load(l, e, ci)) return true;
+        return false;
+    };
+    auto full = [&]() { for (size_t i = 0; i < moe_cards_.size(); ++i) if (moe_held_[i] + (1ull << 20) < moe_cap_[i]) return false; return true; };
+    int n_put = 0, n_shared = 0;
+    for (int l = 0; l < nl; ++l)                                 // the shared experts: every token uses them
+        if (layer_weights_[(size_t)l].moe && put(l, (int)layer_weights_[(size_t)l].moe_expert_count)) { ++n_put; ++n_shared; }
+    const int home = moe_home_now();
+    if (mode == 1 && home < 0) {                                 // home, whole layers: every expert of layer 0, then 1, ...
+        for (int l = 0; l < nl && !full(); ++l) {
+            const auto& lw = layer_weights_[(size_t)l];
+            if (!lw.moe) continue;
+            for (int e = 0; e < (int)lw.moe_expert_count; ++e) if (put(l, e)) ++n_put;
+        }
+    } else {                                                     // N per layer (home), or an even spread (prompt-picked's start)
+        int max_e = 0;
+        for (const auto& lw : layer_weights_) if (lw.moe) max_e = std::max(max_e, (int)lw.moe_expert_count);
+        const int upto = mode == 1 ? std::min(home, max_e) : max_e;
+        for (int e = 0; e < upto && !full(); ++e)
+            for (int l = 0; l < nl; ++l)
+                if (layer_weights_[(size_t)l].moe && e < (int)layer_weights_[(size_t)l].moe_expert_count && put(l, e)) ++n_put;
+    }
+    size_t held = 0, cap = 0; for (size_t i = 0; i < moe_cards_.size(); ++i) { held += moe_held_[i]; cap += moe_cap_[i]; }
+    int total = 0; for (const auto& lw : layer_weights_) if (lw.moe) total += (int)lw.moe_expert_count + (lw.moe_has_shared ? 1 : 0);
+    fprintf(stderr, "[moe] experts on the cards (--moe-experts %s%s): %d of %d (%d shared), %zu MB, %.1f s | room: %s\n",
+            mname, mode == 1 ? (home < 0 ? ", whole layers" : (", " + std::to_string(home) + " per layer").c_str()) : ", an even spread until the first prompt",
+            n_put, total, n_shared, held >> 20, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), where.c_str());
+    if (n_put == 0) fprintf(stderr, "[moe] (no expert went on a card: their weight types have no card kernel -- they stay on the CPU)\n");
+    fflush(stderr);
+#endif
+}
+
+// Prompt-picked: give the card room to the experts that were used most since the last check. Residents that were not used
+// keep their place unless a used one needs it. Usage halves after each check, so a new topic takes over quickly.
+inline void Transformer::moe_rebalance(const char* why) {
+#ifdef NEXUS_VULKAN
+    moe_due_ = false; moe_since_ = 0;
+    if (moe_cards_.empty()) return;
+    std::vector<std::pair<int, int>> aside; aside.swap(moe_aside_);
+    if (moe_mode_now() != 2) {                                   // home: the same experts back where they were
+        int back = 0;
+        for (const auto& le : aside) {
+            bool ok = false;
+            for (int ci = 0; ci < (int)moe_cards_.size() && !ok; ++ci) ok = moe_load(le.first, le.second, ci);
+            back += ok;
+        }
+        if (!aside.empty()) { fprintf(stderr, "[moe] %d of %d home experts back on the card after the prompt\n", back, (int)aside.size()); fflush(stderr); }
+        return;
+    }
+    std::vector<std::vector<uint8_t>> was_aside(moe_res_.size());
+    for (size_t l = 0; l < moe_res_.size(); ++l) was_aside[l].assign(moe_res_[l].size(), 0);
+    for (const auto& le : aside) was_aside[(size_t)le.first][(size_t)le.second] = 1;
+    struct Cand { int l, e; float score; bool res; size_t bytes; };
+    std::vector<Cand> v;
+    double used_total = 0, used_on_card = 0;
+    for (int l = 0; l < (int)moe_res_.size(); ++l) {
+        const auto& lw = layer_weights_[(size_t)l];
+        if (!lw.moe) continue;
+        for (int e = 0; e <= (int)lw.moe_expert_count; ++e) {
+            const bool res = moe_res_[(size_t)l][(size_t)e] >= 0 || was_aside[(size_t)l][(size_t)e];   // aside counts as resident
+            float sc = moe_use_[(size_t)l][(size_t)e];
+            if (e < (int)lw.moe_expert_count) { used_total += sc; if (res) used_on_card += sc; }
+            if (e == (int)lw.moe_expert_count) sc = 1e30f;               // shared: always
+            if (sc <= 0.0f && !res) continue;
+            gpu::VulkanBackend::MoeJob j{};
+            if (!moe_expert_job(lw, e, j)) continue;
+            const size_t b = moe_job_bytes(*moe_cards_[0], j);
+            if (!b) continue;
+            v.push_back({l, e, sc, res, b});
+        }
+    }
+    if (used_total <= 0) {                                       // nothing used yet: just put back what stepped aside
+        for (const auto& le : aside) for (int ci = 0; ci < (int)moe_cards_.size(); ++ci) if (moe_load(le.first, le.second, ci)) break;
+        return;
+    }
+    // most used first; on a tie a resident wins (no pointless swaps)
+    std::stable_sort(v.begin(), v.end(), [](const Cand& a, const Cand& b) { return a.score != b.score ? a.score > b.score : (a.res && !b.res); });
+    size_t cap = 0; for (size_t i = 0; i < moe_cards_.size(); ++i) cap += moe_cap_[i];
+    size_t take = 0; std::vector<uint8_t> keep(v.size(), 0);
+    for (size_t i = 0; i < v.size(); ++i) if (take + v[i].bytes <= cap) { keep[i] = 1; take += v[i].bytes; }
+    const auto t0 = std::chrono::steady_clock::now();
+    int out = 0, in = 0, missed = 0; size_t in_bytes = 0;
+    for (size_t i = 0; i < v.size(); ++i) if (v[i].res && !keep[i] && moe_res_[(size_t)v[i].l][(size_t)v[i].e] >= 0) { moe_unload(v[i].l, v[i].e); ++out; }
+    int back = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (!keep[i] || moe_res_[(size_t)v[i].l][(size_t)v[i].e] >= 0) continue;
+        if (was_aside[(size_t)v[i].l][(size_t)v[i].e]) {     // stepped aside for the prompt: back, not "moved"
+            bool ok = false;
+            for (int ci = 0; ci < (int)moe_cards_.size() && !ok; ++ci) ok = moe_load(v[i].l, v[i].e, ci);
+            back += ok; if (!ok) ++missed;
+            continue;
+        }
+        bool ok = false;
+        for (int ci = 0; ci < (int)moe_cards_.size() && !ok; ++ci) ok = moe_load(v[i].l, v[i].e, ci);
+        if (ok) { ++in; in_bytes += v[i].bytes; } else ++missed;
+    }
+    double after = 0;
+    for (int l = 0; l < (int)moe_res_.size(); ++l)
+        for (int e = 0; e + 1 < (int)moe_res_[(size_t)l].size(); ++e) {
+            if (moe_res_[(size_t)l][(size_t)e] >= 0) after += moe_use_[(size_t)l][(size_t)e];
+            moe_use_[(size_t)l][(size_t)e] *= 0.5f;
+        }
+    fprintf(stderr, "[moe] prompt-picked (%s): %d experts moved onto the cards (%zu MB, %.0f ms), %d made room%s%s | of the expert uses "
+                    "since the last check %.0f%% were on a card, now %.0f%% would be\n",
+            why, in, in_bytes >> 20, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), out,
+            missed ? (" (" + std::to_string(missed) + " did not fit)").c_str() : "",
+            aside.empty() ? "" : (", " + std::to_string(back) + " back after stepping aside for the prompt").c_str(),
+            100.0 * used_on_card / used_total, 100.0 * after / used_total);
+    fflush(stderr);
+#else
+    (void)why;
+#endif
+}
+
+inline std::vector<Transformer::LmPiece> Transformer::lm_pieces(gpu::VulkanBackend& c) const
+{
+    std::vector<LmPiece> v;
+#ifdef NEXUS_VULKAN
+    if (lm_pieces_key_[0] == (const void*)&c && lm_pieces_key_[1] == lm_head_weight && !lm_pieces_cache_.empty()) return lm_pieces_cache_;
+    const size_t vocab = (size_t)meta_.vocab_size, hidden = (size_t)meta_.hidden_dim;
+    size_t row_bytes = 0, b = 0; uint32_t nb = 0;
+    if (!lm_head_weight || !vocab || !c.size_for_public(lm_head_type, 1, hidden, row_bytes, nb) || !row_bytes) return v;
+    // the most rows one buffer may hold on this card (NEXUS_LM_CHUNK_ROWS caps it, for testing the split)
+    size_t per = vocab;
+    static const size_t cap = [] { const char* e = std::getenv("NEXUS_LM_CHUNK_ROWS"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)0; }();
+    if (cap) per = std::min(per, cap);
+    while (per > 0 && !c.size_for_public(lm_head_type, per, hidden, b, nb)) per /= 2;
+    if (per == 0) return v;
+    for (size_t r = 0; r < vocab; r += per) {
+        const size_t n = std::min(per, vocab - r);
+        if (!c.size_for_public(lm_head_type, n, hidden, b, nb)) return {};
+        v.push_back({(const uint8_t*)lm_head_weight + r * row_bytes, r, n, b});
+    }
+    lm_pieces_cache_ = v; lm_pieces_key_[0] = (const void*)&c; lm_pieces_key_[1] = lm_head_weight;
+#else
+    (void)c;
+#endif
+    return v;
+}
+
+inline bool Transformer::lm_head_card_matvec(const float* in, float* out)
+{
+#ifdef NEXUS_VULKAN
+    gpu::VulkanBackend& c = lm_card();
+    const size_t hidden = (size_t)meta_.hidden_dim;
+    const std::vector<LmPiece> pieces = lm_pieces(c);
+    if (pieces.empty()) return false;
+    for (const LmPiece& pc : pieces)
+        if (!c.mat_vec(pc.w, in, out + pc.row0, pc.rows, hidden, lm_head_type)) return false;
+    return true;
+#else
+    (void)in; (void)out; return false;
+#endif
+}
+
+// How fast a card reads weights while writing a token (GB/s): a ~64 MB matrix-vector product, best of 3, measured once
+// per card. Writing a token is reading every weight once, so this is the number that decides which card is faster for
+// it -- not the card's size, and not its prompt speed.
+inline double Transformer::card_read_gbps(gpu::VulkanBackend& c)
+{
+#ifdef NEXUS_VULKAN
+    for (const auto& kv : card_gbps_) if (kv.first == &c) return kv.second;
+    double gbps = 0.0;
+    const size_t cols = 4096;
+    size_t row_bytes = 0; uint32_t nb = 0;
+    if (c.ready() && c.size_for_public(QuantType::Q8_0, 1, cols, row_bytes, nb) && row_bytes) {
+        const size_t rows = std::max<size_t>(1024, (64ull << 20) / row_bytes);
+        size_t bytes = 0;
+        if (c.size_for_public(QuantType::Q8_0, rows, cols, bytes, nb)) {
+            std::vector<uint8_t> w(bytes, 0);                 // all zeros is a valid Q8_0 matrix; speed doesn't depend on the values
+            std::vector<float> x(cols, 1.0f), y(rows, 0.0f);
+            const size_t old_budget = c.weight_cache_budget();
+            if (old_budget) c.set_weight_cache_budget(std::max<size_t>(old_budget, c.weight_cache_used() + bytes + ((size_t)64 << 20)));
+            c.ensure_activation_buffers_public(cols * sizeof(float), rows * sizeof(float));
+            double best = 1e30; bool ok = c.mat_vec(w.data(), x.data(), y.data(), rows, cols, QuantType::Q8_0);   // warm-up + upload
+            for (int i = 0; ok && i < 3; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                ok = c.mat_vec(w.data(), x.data(), y.data(), rows, cols, QuantType::Q8_0);
+                best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+            c.evict_weight_public(w.data());
+            if (old_budget) c.set_weight_cache_budget(old_budget);
+            if (ok && best > 0 && best < 1e29) gbps = (double)bytes / best / 1e9;
+        }
+    }
+    card_gbps_.push_back({&c, gbps});
+    return gbps;
+#else
+    (void)c; return 0.0;
+#endif
+}
+
+// The lm_head (vocab x hidden -- 638 MB on Qwen 3.5 9B) is read in full for every token, like a layer, and while it sits on
+// the CPU the no-wait layer chain stays off. It used to go on a card only when every layer was on card 1.
+//
+// --lm-head first (default): it goes on the FASTEST card that has room for it. If no card has room, it goes on the
+//   fastest card anyway and that card hands back its last layers to make room (they run on the CPU) -- the head first.
+// --lm-head after: only on a card that still has room once the layers are on; never moves a layer.
+// --lm-head cpu:   stays on the CPU.
+// Card 1 is skipped while it is parking (parking owns that card's sums). A head in a type the card has no kernel for, or a
+// slow one (F32 / F16 / BF16 / K-quants), is re-encoded to Q8_0 first -- the same thing a fully-offloaded model always did.
+inline void Transformer::place_lm_head_on_a_card()
+{
+#ifdef NEXUS_VULKAN
+    if (gpu_lm_head_ || !lm_head_weight) return;
+    static const int mode = [] {           // 0 first, 1 after, 2 cpu
+        const char* e = std::getenv("NEXUS_LMHEAD_MODE");
+        if (!e || !*e) return 0;
+        if (!std::strcmp(e, "after")) return 1;
+        if (!std::strcmp(e, "cpu")) return 2;
+        return 0;
+    }();
+    const char* mode_name = mode == 0 ? "first" : mode == 1 ? "after" : "cpu";
+    if (mode == 2) { fprintf(stderr, "[nexus] lm_head stays on the CPU (--lm-head cpu)\n"); return; }
+    if (!nx_lm_head_gpu_ok(lm_head_type)) {
+        fprintf(stderr, "[nexus] lm_head stays on the CPU: NEXUS_LMHEAD_CPU is set\n");
+        return;
+    }
+    const size_t vocab = (size_t)meta_.vocab_size, hidden = (size_t)meta_.hidden_dim;
+    if (!vocab || !hidden) return;
+
+    std::vector<gpu::VulkanBackend*> cards;
+    for (gpu::VulkanBackend* c : all_cards()) if (!(c == &gpu::gpu() && park_on_)) cards.push_back(c);
+    if (cards.empty()) { fprintf(stderr, "[nexus] lm_head stays on the CPU: the only card is parking\n"); return; }
+
+    // fastest first
+    std::string speeds;
+    for (gpu::VulkanBackend* c : cards) {
+        char b[160]; snprintf(b, sizeof b, "%s%s %.0f GB/s", speeds.empty() ? "" : ", ", c->info().device_name.c_str(), card_read_gbps(*c));
+        speeds += b;
+    }
+    std::stable_sort(cards.begin(), cards.end(), [&](gpu::VulkanBackend* a, gpu::VulkanBackend* b) { return card_read_gbps(*a) > card_read_gbps(*b); });
+    fprintf(stderr, "[nexus] how fast each card reads weights while writing: %s\n", speeds.c_str());
+
+    // a type the card can't run, or a slow one: Q8_0 (as the fully-offloaded path always did)
+    const void* orig_w = lm_head_weight; const QuantType orig_t = lm_head_type;
+    {
+        static const bool q8_off = [] { const char* e = std::getenv("NEXUS_LMHEAD_Q8"); return e && e[0] == '0'; }();
+        size_t rb = 0; uint32_t nb = 0;
+        const bool no_kernel = !cards[0]->size_for_public(lm_head_type, 1, hidden, rb, nb);
+        const bool slow = lm_head_type == QuantType::F32 || lm_head_type == QuantType::F16 || lm_head_type == QuantType::BF16 ||
+                          lm_head_type == QuantType::Q2_K || lm_head_type == QuantType::Q3_K || lm_head_type == QuantType::Q4_K ||
+                          lm_head_type == QuantType::Q5_K || lm_head_type == QuantType::Q6_K;
+        if ((no_kernel || (slow && !q8_off)) && hidden % 32 == 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (nx_requant_to_q8_0(lm_head_weight, lm_head_type, vocab, hidden, n_threads_, lm_head_q8_)) {
+                lm_head_weight = lm_head_q8_.data(); lm_head_type = QuantType::Q8_0;
+                fprintf(stderr, "[nexus] lm_head (type %d%s) re-encoded to Q8_0 for the card: %.0f MB, %.1f s\n", (int)orig_t,
+                        no_kernel ? ", no card kernel for it" : "", lm_head_q8_.size() / 1048576.0,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
+    }
+
+    auto room_on = [&](gpu::VulkanBackend* c, size_t& free_now, size_t& keep) {
+        free_now = 0;
+        if (!c->vram_free_now(free_now) || free_now == 0)
+            free_now = (size_t)c->info().vram_bytes > c->weight_cache_used() ? (size_t)c->info().vram_bytes - c->weight_cache_used() : 0;
+        if (const size_t fake = nx_fake_vram_free_mb()) free_now = fake << 20;
+        keep = card_keep_bytes(free_now);
+        return free_now > keep ? free_now - keep : (size_t)0;
+    };
+    auto put_on = [&](gpu::VulkanBackend* c, const std::vector<LmPiece>& pieces, size_t w_bytes, const char* why) -> bool {
+        const size_t need = w_bytes + (vocab + hidden) * sizeof(float);
+        const size_t old_budget = c->weight_cache_budget();
+        if (old_budget) c->set_weight_cache_budget(std::max<size_t>(old_budget, c->weight_cache_used() + need + ((size_t)64 << 20)));
+        c->ensure_activation_buffers_public(hidden * sizeof(float), vocab * sizeof(float));
+        bool up = true;
+        for (const LmPiece& pc : pieces) up = up && c->get_weight_buffer_public(pc.w, pc.bytes, lm_head_type);
+        if (!up) { for (const LmPiece& pc : pieces) c->evict_weight_public(pc.w); if (old_budget) c->set_weight_cache_budget(old_budget); return false; }
+        for (const LmPiece& pc : pieces) c->pin_weight_public(pc.w);
+        lm_card_ = c; gpu_lm_head_ = true;
+        size_t left = 0; c->vram_free_now(left);
+        fprintf(stderr, "[nexus] lm_head (%zu MB%s) on %s, %s -- the output step runs on the card now "
+                        "(%zu MB free there now, --lm-head %s)\n", w_bytes >> 20,
+                pieces.size() > 1 ? (", in " + std::to_string(pieces.size()) + " pieces").c_str() : "",
+                c->info().device_name.c_str(), why, left >> 20, mode_name);
+        fflush(stderr);
+        return true;
+    };
+
+    // 1) the fastest card that already has room -- no layer moves
+    std::string tried;
+    for (gpu::VulkanBackend* c : cards) {
+        const std::vector<LmPiece> pieces = lm_pieces(*c);
+        if (pieces.empty()) { tried += "  " + c->info().device_name + ": no kernel for its type\n"; continue; }
+        size_t w_bytes = 0; for (const LmPiece& pc : pieces) w_bytes += pc.bytes;
+        size_t fr = 0, keep = 0; const size_t room = room_on(c, fr, keep);
+        if (room >= w_bytes + (vocab + hidden) * sizeof(float) && put_on(c, pieces, w_bytes, c == cards[0] ? "the fastest card" : "the fastest card with room for it")) return;
+        char b[220]; snprintf(b, sizeof b, "  %s: %zu MB free, %zu MB kept free, needs %zu MB\n", c->info().device_name.c_str(), fr >> 20, keep >> 20, w_bytes >> 20);
+        tried += b;
+    }
+
+    // 2) --lm-head first: no card has room, so the fastest card hands back its last layers until the head fits.
+    //    Decided by counted bytes BEFORE anything moves: if all of that card's layers together still wouldn't make room,
+    //    nothing is touched. If the upload fails anyway, the layers go back on.
+    if (mode == 0) {
+        gpu::VulkanBackend* c = cards[0];
+        const std::vector<LmPiece> pieces = lm_pieces(*c);
+        size_t w_bytes = 0; for (const LmPiece& pc : pieces) w_bytes += pc.bytes;
+        const size_t need = w_bytes + (vocab + hidden) * sizeof(float);
+        size_t fr = 0, keep = 0; const size_t room_now = room_on(c, fr, keep);
+        const size_t short_by = need > room_now ? need - room_now : 0;
+        struct Given { int l; bool card2; int gpux; std::vector<const void*> w; size_t bytes; };
+        std::vector<Given> plan; size_t planned = 0;
+        for (int l = (int)layer_weights_.size() - 1; !pieces.empty() && l >= 0 && planned < short_by; --l) {
+            TransformerLayerWeights& lw = layer_weights_[(size_t)l];
+            if (layer_card(lw) != c) continue;
+            std::vector<const void*>* held = nullptr;
+            if (lw.gpu2_layer && (size_t)l < other_card_w_.size()) held = &other_card_w_[(size_t)l];
+            else if (lw.gpu_layer && (size_t)l < primary_card_w_.size()) held = &primary_card_w_[(size_t)l];
+            if (!held || held->empty()) continue;            // computed on the card but read from RAM: takes no card memory
+            const size_t b = turbo_layer_weight_bytes(l);
+            plan.push_back({l, (bool)lw.gpu2_layer, lw.gpux, *held, b}); planned += b;
+        }
+        if (!pieces.empty() && planned >= short_by && !plan.empty()) {
+            c->wait_idle();
+            for (Given& g : plan) {
+                TransformerLayerWeights& lw = layer_weights_[(size_t)g.l];
+                for (const void* w : g.w) { c->unpin_weight_public(w); c->evict_weight_public(w); }
+                if (g.card2) { other_card_w_[(size_t)g.l].clear(); lw.gpu2_layer = false; lw.gpux = -1; }
+                else { primary_card_w_[(size_t)g.l].clear(); lw.gpu_layer = false; }
+            }
+            // the room is what was there plus what was just handed back (a driver can be slow to report freed memory)
+            if (c->weight_cache_budget()) c->set_weight_cache_budget(std::max<size_t>(c->weight_cache_budget(), c->weight_cache_used() + need + ((size_t)64 << 20)));
+            if (put_on(c, pieces, w_bytes, "the fastest card")) {
+                int lo = plan.back().l, hi = plan.front().l;
+                for (Given& g : plan) {
+                    if (!g.card2 && n_gpu_layers_ > g.l) { n_gpu_layers_ = g.l; c->set_gpu_layers(n_gpu_layers_); }
+                    if (park_on_ && (size_t)g.l < park_state_.size() && park_state_[(size_t)g.l] == 0) park_touch_layer(g.l);
+                }
+                const std::string which = lo == hi ? "layer " + std::to_string(lo) : "layers " + std::to_string(lo) + "-" + std::to_string(hi);
+                fprintf(stderr, "[nexus] --lm-head first: no card had room, so %s handed back %s (%zu MB) to make room for it -- "
+                                "%s on the CPU now (--lm-head after keeps the layers on the card and the head on the CPU)\n",
+                        c->info().device_name.c_str(), which.c_str(), planned >> 20, lo == hi ? "it runs" : "they run");
+                fflush(stderr);
+                return;
+            }
+            // the head would not go on after all: the layers go back where they were
+            for (Given& g : plan) {
+                TransformerLayerWeights& lw = layer_weights_[(size_t)g.l];
+                std::vector<const void*> mine;
+                if (!eager_upload_layer_weights(g.l, *c, &mine)) { for (const void* w : mine) c->evict_weight_public(w); continue; }
+                for (const void* w : mine) c->pin_weight_public(w);
+                if (g.card2) { other_card_w_[(size_t)g.l] = mine; lw.gpu2_layer = true; lw.gpux = g.gpux; }
+                else { primary_card_w_[(size_t)g.l] = mine; lw.gpu_layer = true; }
+            }
+            tried += "  " + c->info().device_name + ": handed layers back but the upload still failed -- they are back on the card\n";
+        } else if (!pieces.empty()) {
+            char b[220]; snprintf(b, sizeof b, "  --lm-head first: all of %s's layers together (%zu MB) would not make the %zu MB it is short by\n",
+                                  c->info().device_name.c_str(), planned >> 20, short_by >> 20);
+            tried += b;
+        }
+    }
+
+    // nowhere: back to the original encoding, the CPU runs it
+    if (lm_head_weight != orig_w) { lm_head_weight = orig_w; lm_head_type = orig_t; lm_head_q8_.clear(); lm_head_q8_.shrink_to_fit(); }
+    fprintf(stderr, "[nexus] lm_head stays on the CPU -- no card had room (--lm-head %s):\n%s", mode_name, tried.c_str());
+    fflush(stderr);
+#endif
+}
+
+// Where every layer ACTUALLY computed while writing a token, printed once per run. Weights sitting on a card are not
+// the same thing as a layer running on it, and until now nothing said which was true -- a model could fill two cards
+// and still be written entirely by the CPU without one line about it.
+inline void Transformer::report_decode_placement() {
+    const int n = (int)meta_.n_layers;
+    if (n <= 0) return;
+    if ((int)dec_ran_.size() != n) { dec_ran_.assign((size_t)n, 0); dec_why_.assign((size_t)n, nullptr); }
+    // what each layer is for: the card it is meant to be on, and what happened
+    auto where = [&](int l) -> std::string {
+        const auto& lw = layer_weights_[(size_t)l];
+        int card_no = 0; std::string name;
+#ifdef NEXUS_VULKAN
+        if (lw.gpu_layer || (park_on_ && (size_t)l < park_state_.size() && park_state_[(size_t)l] == 2)) {
+            card_no = 1; if (gpu::gpu().ready()) name = gpu::gpu().info().device_name;
+        } else if (lw.gpu2_layer) {
+            card_no = 2; if (gpu::VulkanBackend* b = backend2_for(lw)) if (b->ready()) name = b->info().device_name;
+        } else if (lw.gpux >= 0) card_no = lw.gpux + 1;
+#endif
+        const uint8_t ran = dec_ran_[(size_t)l];
+        if (card_no == 0) return "the CPU (no card holds it)";
+        std::string card = "card " + std::to_string(card_no) + (name.empty() ? std::string() : " (" + name + ")");
+        if (ran == 1) return card;
+        const char* why = dec_why_[(size_t)l];
+        return "the CPU, although " + card + " holds it" + (why ? std::string(": ") + why : std::string(ran == 0 ? ": it never reached the card path" : ""));
+    };
+    std::string prev = where(0); int start = 0; bool any_cpu_on_card = false;
+    fprintf(stderr, "[decode] where each layer was written (weights on a card are not the same as a layer running on it):\n");
+    for (int l = 1; l <= n; ++l) {
+        std::string cur = l < n ? where(l) : std::string();
+        if (l == n || cur != prev) {
+            fprintf(stderr, "[decode]   layer%s %d%s -> %s\n", l - 1 > start ? "s" : "", start,
+                    l - 1 > start ? ("-" + std::to_string(l - 1)).c_str() : "", prev.c_str());
+            if (prev.rfind("the CPU, although", 0) == 0) any_cpu_on_card = true;
+            start = l; prev = cur;
+        }
+    }
+    if (any_cpu_on_card)
+        fprintf(stderr, "[decode] layers above that say \"the CPU, although\" are the whole speed problem: their weights are "
+                        "taking up card memory and the processor is doing the work anyway.\n");
+    fflush(stderr);
+    dec_reported_ = true;
+}
+
 inline void Transformer::q35_chain_flush(float* x)
 {
 #ifdef NEXUS_VULKAN
-    gpu::VulkanBackend& g = gpu::gpu();
-    if (g.chain_is_open()) g.chain_end(x, (size_t)meta_.hidden_dim);
+    // Every card's chain, not just card 1's: with layers on two cards, card 2 runs a chain of its own.
+    for (gpu::VulkanBackend* g : all_cards())
+        if (g->chain_is_open()) g->chain_end(x, (size_t)meta_.hidden_dim);
     for (const Q35ChainKv& c : q35_chain_kv_) {
+        gpu::VulkanBackend& g = c.card ? *(gpu::VulkanBackend*)c.card : gpu::gpu();
         const float* kv = g.chain_kv_ptr(c.slot);
         if (!kv) continue;
         kvcache_.store(c.layer, c.pos, kv, kv + (size_t)c.nkv * c.hd, c.nkv * c.hd);
@@ -9081,8 +10415,19 @@ inline void Transformer::forward_layer(int l, float* x, int pos) {
     }
 
     // Qwen3.5 linear-attention layers: the whole layer (incl. its FFN) as ONE GPU submit, recurrent state kept on the card.
-    if (lw.qwen35_linear && q35_gpu_linear_step(lw, l, x)) return;
-    if (!lw.qwen35_linear && !lw.moe && q35_gpu_full_step(lw, l, x, pos)) return;   // full-attention layer (Qwen3.5 gated or plain): whole layer on the GPU with a KV mirror
+    if (lw.moe) {
+        // Mixture of experts: the attention half on the layer's card (one submit), then the experts -- on whichever cards
+        // hold them, the rest on the CPU, at the same time (forward_ffn).
+        if (lw.qwen35_linear ? q35_gpu_linear_step(lw, l, x) : q35_gpu_full_step(lw, l, x, pos)) {
+            float* xm = xb_scratch_.data();
+            nx_apply_model_norm(x, lw.ffn_norm, lw.ffn_norm_bias, xm, (size_t)hidden, meta_.rms_norm_eps, lw.ffn_norm_zc);
+            forward_ffn(lw, xm);
+            cpu::add_inplace(x, xm, (size_t)hidden);
+            return;
+        }
+    }
+    else if (lw.qwen35_linear && q35_gpu_linear_step(lw, l, x)) return;
+    else if (!lw.qwen35_linear && q35_gpu_full_step(lw, l, x, pos)) return;   // full-attention layer (Qwen3.5 gated or plain): whole layer on the GPU with a KV mirror
 
     // ------ Batched GPU layer path ------------------------------------------------------------------------------------------------------------------------------------------------
     // When GPU activation buffers are ready, run all GPU ops as 2 submits per
@@ -10152,8 +11497,10 @@ inline void Transformer::forward_ffn(const TransformerLayerWeights& lw, float* x
                 }
             };
 
+            // The old way: one card round trip per expert matrix (~1,000 per token), uploading whatever wasn't cached.
+            // Replaced by the expert placement (moe_place) -- opt back in with NEXUS_MOE_GPU_EXPERTS=1.
             const char* moe_gpu_env = std::getenv("NEXUS_MOE_GPU_EXPERTS");
-            const bool moe_gpu_enabled = !(moe_gpu_env && moe_gpu_env[0] == '0');
+            const bool moe_gpu_enabled = moe_gpu_env && moe_gpu_env[0] == '1';
             if (!transposed && moe_gpu_enabled && lw.gpu_layer && gpu::gpu().ready() &&
                 moe_gpu_matvec_supported(qt, in_cols))
             {
@@ -10172,6 +11519,27 @@ inline void Transformer::forward_ffn(const TransformerLayerWeights& lw, float* x
                 }
             }
 #endif
+
+            // The fast path: the same optimized cpu::mat_vec the dense layers use (its thread pool, SIMD, 8-bit dot products),
+            // whenever the row width is a whole number of quant blocks -- always true for Qwen / Mixtral / DeepSeek experts.
+            // The row-by-row path below spawned a fresh set of OS threads for EVERY expert matrix (about 7,500 thread launches
+            // per token on a 40-layer, top-8 model) and did scalar dot products; it is kept only for odd widths (PhiMoE's 960).
+            // NEXUS_MOE_SLOW_CPU=1 forces the old path.
+            {
+                static const bool slow = [] { const char* e = std::getenv("NEXUS_MOE_SLOW_CPU"); return e && e[0] == '1'; }();
+                size_t blk = 0;
+                switch (qt) {
+                    case QuantType::F32: case QuantType::F16: case QuantType::BF16: blk = 1; break;
+                    case QuantType::Q8_0: case QuantType::Q4_0: case QuantType::Q5_0: blk = 32; break;
+                    case QuantType::Q2_K: case QuantType::Q3_K: case QuantType::Q4_K: case QuantType::Q5_K: case QuantType::Q6_K: blk = 256; break;
+                    case QuantType::NQ4_G64: case QuantType::NQ5_G64: case QuantType::NQ6_G64: case QuantType::NQ8_G64: blk = 64; break;
+                    default: blk = 0; break;
+                }
+                if (!slow && !transposed && blk && (size_t)in_cols % blk == 0) {
+                    cpu::mat_vec(W, vin, vout, (size_t)out_rows, (size_t)in_cols, qt, n_threads_);
+                    return;
+                }
+            }
 
             // Worker count is capped by the row count along the parallel axis
             // so we never spawn idle threads.
@@ -10447,6 +11815,100 @@ inline void Transformer::forward_ffn(const TransformerLayerWeights& lw, float* x
 
         const bool normalize_selected = lw.moe_normalize_topk;
         const float scale = lw.moe_route_scale;
+
+        // ---- experts on the cards (moe_place / moe_rebalance) --------------------------------------------------------------
+        // Each card runs the chosen experts it holds in ONE submit, on its own thread, while this thread does the rest on
+        // the CPU. Results are added in the same order as the CPU path below (routed experts in rank order, shared last).
+        const int lidx = (int)(&lw - layer_weights_.data());
+        const bool lidx_ok = lidx >= 0 && lidx < (int)moe_use_.size() && (int)moe_use_[(size_t)lidx].size() > n_exp;
+        if (lidx_ok) for (int j = 0; j < top_k; ++j) moe_use_[(size_t)lidx][(size_t)idx[j]] += 1.0f;
+#ifdef NEXUS_VULKAN
+        if (lidx_ok && lidx < (int)moe_layer_on_card_.size() && moe_layer_on_card_[(size_t)lidx]) {
+            struct Item { int e; float w; int card; };
+            std::vector<Item> items; items.reserve((size_t)top_k + 1);
+            for (int j = 0; j < top_k; ++j) {
+                float w = route_weight[idx[j]];
+                if (normalize_selected && selected_sum > 1e-12f) w /= selected_sum;
+                w *= scale;
+                if (w != 0.0f) items.push_back({idx[j], w, moe_res_[(size_t)lidx][(size_t)idx[j]]});
+            }
+            const bool shared = lw.moe_has_shared && lw.wgate_shexp && lw.wup_shexp && lw.wdown_shexp;
+            if (shared) {
+                float shexp_scale = 1.0f;
+                if (lw.wgate_inp_shexp) { float dot = 0.0f; for (int i = 0; i < hidden; ++i) dot += x[i] * lw.wgate_inp_shexp[i]; shexp_scale = sigmoid(dot); }
+                items.push_back({n_exp, shexp_scale, moe_res_[(size_t)lidx][(size_t)n_exp]});
+            }
+            const size_t ni = items.size(), H = (size_t)hidden;
+            std::vector<float> res(ni * H, 0.0f);
+            const size_t nc = moe_cards_.size();
+            std::vector<std::vector<int>> grp(nc);
+            std::vector<std::vector<gpu::VulkanBackend::MoeJob>> jobs(nc);
+            for (size_t i = 0; i < ni; ++i) {
+                const int c = items[i].card;
+                gpu::VulkanBackend::MoeJob jb{};
+                if (c >= 0 && c < (int)nc && (int)grp[(size_t)c].size() < gpu::VulkanBackend::kMoeMaxJobs && moe_expert_job(lw, items[i].e, jb)) {
+                    grp[(size_t)c].push_back((int)i); jobs[(size_t)c].push_back(jb);
+                } else items[i].card = -1;
+            }
+            std::vector<std::vector<float>> cres(nc);
+            std::vector<std::future<bool>> fut(nc);
+            for (size_t c = 0; c < nc; ++c) {
+                if (grp[c].empty()) continue;
+                cres[c].assign(grp[c].size() * H, 0.0f);
+                fut[c] = std::async(std::launch::async, [this, c, &jobs, &cres, x, hidden]() {
+                    return moe_cards_[c]->moe_experts_run(jobs[c].data(), (int)jobs[c].size(), x, (uint32_t)hidden, cres[c].data());
+                });
+            }
+            std::vector<float> g1((size_t)std::max(ffn, (int)lw.moe_shared_ffn_dim)), u1(g1.size());
+            auto cpu_expert = [&](int e, float* dst) {
+                if (e == n_exp) {
+                    const int sffn = (int)lw.moe_shared_ffn_dim;
+                    moe_mat_vec(lw.wgate_shexp, x, g1.data(), (int)lw.moe_shared_gate_rows, (int)lw.moe_shared_gate_cols, lw.wgate_shexp_type, lw.moe_shared_gate_transposed);
+                    moe_mat_vec(lw.wup_shexp,   x, u1.data(), (int)lw.moe_shared_up_rows,   (int)lw.moe_shared_up_cols,   lw.wup_shexp_type,   lw.moe_shared_up_transposed);
+                    cpu::silu(g1.data(), (size_t)sffn); cpu::mul(g1.data(), u1.data(), g1.data(), (size_t)sffn);
+                    moe_mat_vec(lw.wdown_shexp, g1.data(), dst, (int)lw.moe_shared_down_rows, (int)lw.moe_shared_down_cols, lw.wdown_shexp_type, lw.moe_shared_down_transposed);
+                    return;
+                }
+                if (lw.moe_fused_gate_up) {
+                    std::vector<float> gu((size_t)ffn * 2);
+                    moe_mat_vec(expert_ptr(lw.wup_exps, lw.wup_exps_stride, e), x, gu.data(), gate_rows, gate_cols, lw.wup_exps_type, lw.moe_fused_transposed);
+                    memcpy(g1.data(), gu.data(), (size_t)ffn * 4); memcpy(u1.data(), gu.data() + ffn, (size_t)ffn * 4);
+                } else {
+                    const void* Wg = lw.moe_split_experts ? lw.wgate_exp_ptrs[(size_t)e] : expert_ptr(lw.wgate_exps, lw.wgate_exps_stride, e);
+                    const void* Wu = lw.moe_split_experts ? lw.wup_exp_ptrs[(size_t)e]   : expert_ptr(lw.wup_exps, lw.wup_exps_stride, e);
+                    const QuantType gt = lw.moe_split_experts ? lw.wgate_exp_types[(size_t)e] : lw.wgate_exps_type;
+                    const QuantType ut = lw.moe_split_experts ? lw.wup_exp_types[(size_t)e]   : lw.wup_exps_type;
+                    moe_mat_vec(Wg, x, g1.data(), (int)lw.moe_gate_rows, (int)lw.moe_gate_cols, gt, lw.moe_gate_transposed);
+                    moe_mat_vec(Wu, x, u1.data(), (int)lw.moe_up_rows,   (int)lw.moe_up_cols,   ut, lw.moe_up_transposed);
+                }
+                cpu::silu(g1.data(), (size_t)ffn); cpu::mul(g1.data(), u1.data(), g1.data(), (size_t)ffn);
+                const void* Wd = lw.moe_split_experts ? lw.wdown_exp_ptrs[(size_t)e] : expert_ptr(lw.wdown_exps, lw.wdown_exps_stride, e);
+                const QuantType dt = lw.moe_split_experts ? lw.wdown_exp_types[(size_t)e] : lw.wdown_exps_type;
+                moe_mat_vec(Wd, g1.data(), dst, (int)lw.moe_down_rows, (int)lw.moe_down_cols, dt, lw.moe_down_transposed);
+            };
+            for (size_t i = 0; i < ni; ++i) if (items[i].card < 0) cpu_expert(items[i].e, res.data() + i * H);
+            for (size_t c = 0; c < nc; ++c) {
+                if (grp[c].empty()) continue;
+                const bool ok = fut[c].get();
+                for (size_t k = 0; k < grp[c].size(); ++k) {
+                    const int i = grp[c][k];
+                    if (ok) memcpy(res.data() + (size_t)i * H, cres[c].data() + k * H, H * 4);
+                    else    cpu_expert(items[(size_t)i].e, res.data() + (size_t)i * H);
+                }
+                if (ok) moe_runs_card_ += grp[c].size();
+                else {
+                    static std::atomic<int> said{0};
+                    if (said.fetch_add(1) < 3) { fprintf(stderr, "[moe] %s would not run its experts for layer %d -- done on the CPU this time\n", moe_cards_[c]->info().device_name.c_str(), lidx); fflush(stderr); }
+                }
+            }
+            moe_runs_all_ += ni;
+            std::vector<float> acc(H, 0.0f);
+            for (size_t i = 0; i < ni; ++i) { const float w = items[i].w; const float* r = res.data() + i * H; for (size_t k = 0; k < H; ++k) acc[k] += w * r[k]; }
+            memcpy(x, acc.data(), H * 4);
+            return;
+        }
+#endif
+        moe_runs_all_ += (size_t)top_k;
         std::vector<float> out((size_t)hidden, 0.0f);
         std::vector<float> gate((size_t)ffn, 0.0f);
         std::vector<float> up((size_t)ffn, 0.0f);
@@ -10740,6 +12202,9 @@ inline bool Transformer::eager_upload_layer_weights(int l, gpu::VulkanBackend& g
     // Helper: compute byte size for a weight matrix and trigger upload
     auto upload_w = [&](const void* W, QuantType qt, size_t rows, size_t cols) {
         if (!W || rows == 0 || cols == 0) return;
+        // Upload what the kernel will actually ask for: a BF16 weight is widened to F32 first, so the card holds the
+        // copy the layer runs from instead of BF16 bytes no kernel can read.
+        bf16widen(W, qt, rows, cols);
         size_t W_size = 0; uint32_t dummy = 0;
         if (g.size_for_public(qt, rows, cols, W_size, dummy) && W_size > 0) {
             mine.emplace_back(W, W_size);
@@ -10747,11 +12212,22 @@ inline bool Transformer::eager_upload_layer_weights(int l, gpu::VulkanBackend& g
         }
     };
 
-    if (lw.fused_qkv) {
+    if (lw.qwen35_linear) {
+        // A Qwen 3.5 linear-attention (Gated DeltaNet) layer: qkv, z, out and beta/alpha, not just qkv.  Without z, out and
+        // beta/alpha the card held only a part of the layer -- turbo_layer_weight_bytes counts them, so the fit maths thought
+        // the layer cost more than what actually landed, and the missing matrices were fetched one at a time while running.
+        const size_t conv  = (size_t)std::max(0, lw.q35_conv_dim);
+        const size_t value = (size_t)std::max(0, lw.q35_value_dim);
+        const size_t vh    = (size_t)std::max(0, lw.q35_num_v_heads);
+        upload_w(lw.q35_qkv ? lw.q35_qkv : lw.wqkv, lw.q35_qkv ? lw.q35_qkv_type : lw.wqkv_type, conv ? conv : q_dim + 2 * kv_dim, hidden);
+        if (value) { upload_w(lw.q35_z, lw.q35_z_type, value, hidden); upload_w(lw.q35_out, lw.q35_out_type, hidden, value); }
+        if (vh) {
+            if (lw.q35_ba) upload_w(lw.q35_ba, lw.q35_ba_type, vh * 2, hidden);
+            else { upload_w(lw.q35_a, lw.q35_a_type, vh, hidden); upload_w(lw.q35_b, lw.q35_b_type, vh, hidden); }
+        }
+    } else if (lw.fused_qkv) {
         // Phi-3 style: single [q_dim + 2*kv_dim, hidden] fused tensor
-        // Qwen3.5 linear-attention layers: in_proj_qkv has conv_dim rows (key*2 + value), NOT q_dim + 2*kv_dim.  Uploading the
-        // smaller size left the card with a truncated matrix and the batched projection read past its end.
-        upload_w(lw.wqkv, lw.wqkv_type, (lw.qwen35_linear && lw.q35_conv_dim > 0) ? (size_t)lw.q35_conv_dim : q_dim + 2 * kv_dim, hidden);
+        upload_w(lw.wqkv, lw.wqkv_type, q_dim + 2 * kv_dim, hidden);
     } else {
         // Qwen3.5/3-Next full-attention q_proj holds query AND gate rows (2 x q_dim).  Uploading only q_dim rows left the
         // card with half of the matrix; the batched projection then read past the end (gate half came out wrong).
@@ -10759,7 +12235,7 @@ inline bool Transformer::eager_upload_layer_weights(int l, gpu::VulkanBackend& g
         upload_w(lw.wk,  lw.wk_type,  kv_dim, hidden);
         upload_w(lw.wv,  lw.wv_type,  kv_dim, hidden);
     }
-    upload_w(lw.wo, lw.wo_type, hidden, q_dim);
+    if (!lw.qwen35_linear) upload_w(lw.wo, lw.wo_type, hidden, q_dim);
 
     if (lw.fused_gate_up) {
         // Phi-3 style: single [2*ffn, hidden] fused tensor
@@ -11057,22 +12533,22 @@ inline void Transformer::prefill_embeddings_stream(const float* embeddings, int 
             turbo_stream_begin_layer(l, "V");
         }
 
-        if (stream && lw.qwen35_linear && !lw.moe &&
+        if (stream && lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
             layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_qwen35_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
         }
-        else if (stream && !lw.qwen35_linear && !lw.moe &&
+        else if (stream && !lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_full_attn_prefill_layer_batch_native_legacy(lw, xp, l, sp, cnt) || forward_full_attn_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
         }
-        else if (!stream && n > 1 && lw.qwen35_linear && !lw.moe &&
+        else if (!stream && n > 1 && lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_qwen35_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
         }
-        else if (!stream && n > 1 && !lw.qwen35_linear && !lw.moe &&
+        else if (!stream && n > 1 && !lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_full_attn_prefill_layer_batch_native_legacy(lw, xp, l, sp, cnt) || forward_full_attn_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
@@ -11125,8 +12601,7 @@ inline void Transformer::prefill_embeddings_stream(const float* embeddings, int 
 
     bool lm_done = false;
     if (gpu_lm_head_ && nx_lm_head_gpu_ok(lm_head_type)) {
-        lm_done = gpu::gpu().mat_vec(lm_head_weight, head_in, logits_.data(),
-                                     (size_t)vocab, (size_t)hidden, lm_head_type);
+        lm_done = lm_head_card_matvec(head_in, logits_.data());
     }
     if (!lm_done) {
         cpu::mat_vec(lm_head_weight, head_in, logits_.data(),
@@ -11333,7 +12808,7 @@ inline void Transformer::q35_replay_state(int layer_idx, int keep) {
         const float* at = r.a.data() + (size_t)t * (size_t)vh;
         const float* bt = r.b.data() + (size_t)t * (size_t)vh;
         for (int hv = 0; hv < vh; ++hv) {
-            const float* k = k_flat.data() + (size_t)(hv / repeat) * hd;
+            const float* k = k_flat.data() + (size_t)(q35_v_tiled_ ? hv % (vh / repeat) : hv / repeat) * hd;   // tiled: llama.cpp GGUF
             const float* v = v_base + (size_t)hv * hd;
             const float beta = nx_sigmoid_f32(bt[hv]);
             float g = lw.q35_A[hv] * nx_softplus_f32(at[hv] + lw.q35_dt[hv]);
@@ -12022,6 +13497,8 @@ inline void Transformer::prefill_cpu_prompt_batch(const std::vector<int32_t>& to
     struct KvTrimGuard {
         Transformer* t; const char* tag; bool on; int n_tok;
         ~KvTrimGuard() {
+            // prompt-picked experts: the next token first moves the experts this prompt used onto the cards
+            if (n_tok >= 16 && !t->pr_active_ && !t->moe_cards_.empty()) t->moe_due_ = true;
             if (!on) return;
             if (n_tok >= 256) {
                 // Prompt-sized GPU staging buffers aren't needed by decode: give the RAM back.
@@ -12087,12 +13564,12 @@ inline void Transformer::prefill_cpu_prompt_batch(const std::vector<int32_t>& to
 
         bool handled_by_cpu_batch = false;
 
-        if (!qwen_native_batch_disabled && n > 1 && lw.qwen35_linear && !lw.moe &&
+        if (!qwen_native_batch_disabled && n > 1 && lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
             layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_qwen35_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_cpu_batch = true;
         }
-        else if (!qwen_native_batch_disabled && n > 1 && !lw.qwen35_linear && !lw.moe &&
+        else if (!qwen_native_batch_disabled && n > 1 && !lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_full_attn_prefill_layer_batch_native_legacy(lw, xp, l, sp, cnt) || forward_full_attn_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_cpu_batch = true;
@@ -12131,8 +13608,7 @@ inline void Transformer::prefill_cpu_prompt_batch(const std::vector<int32_t>& to
 
     bool lm_done = false;
     if (gpu_lm_head_ && nx_lm_head_gpu_ok(lm_head_type)) {
-        lm_done = gpu::gpu().mat_vec(lm_head_weight, head_in, logits_.data(),
-                                     (size_t)vocab, (size_t)hidden, lm_head_type);
+        lm_done = lm_head_card_matvec(head_in, logits_.data());
     }
     if (!lm_done) {
         cpu::mat_vec(lm_head_weight, head_in, logits_.data(),
@@ -12154,6 +13630,7 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
                                         int start_pos, int n,
                                         bool force_no_stream, bool keep_prefill_scratch)
 {
+    if (!gpu_setup_done_) finish_gpu_setup();        // every card has had its turn by now
     // Report KV vs process memory and return freed batch scratch to the OS
     // when this prefill finishes (on every exit path) -- UNLESS the caller says more
     // calls on this same prompt are coming right after (keep_prefill_scratch=true).
@@ -12164,6 +13641,8 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
     struct KvTrimGuard {
         Transformer* t; const char* tag; bool on; int n_tok;
         ~KvTrimGuard() {
+            // prompt-picked experts: the next token first moves the experts this prompt used onto the cards
+            if (n_tok >= 16 && !t->pr_active_ && !t->moe_cards_.empty()) t->moe_due_ = true;
             if (!on) return;
             if (n_tok >= 256) {
                 // Prompt-sized GPU staging buffers aren't needed by decode: give the RAM back.
@@ -12227,6 +13706,7 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
     const bool park_short = park_on_ && !pr_active_ && n < park_min_tokens_ && park_any_on_card();
     const bool stream = turbo_gpu_stream_ && gpu::gpu().ready() && !force_no_stream && !park_short;
     const bool park_long = park_on_ && stream && !pr_active_;
+    if (park_long && moe_park_ci_ >= 0) moe_clear_card(moe_park_ci_);   // the parking card's experts step aside for the prompt
     if (park_long) park_off_gpu(n, start_pos + n);
     if (stream) {
         if (!pr_active_) turbo_keep_prepare();   // layers that live on this card stay there; the rest stream through it
@@ -12325,12 +13805,12 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
         // This batched path keeps the recurrent/conv math in correct token order
         // while pushing the large projection GEMMs through Vulkan mat_mat when
         // possible. Non-Qwen/full-attention layers fall through unchanged.
-        if (!qwen_native_batch_disabled && stream && lw.qwen35_linear && !lw.moe &&
+        if (!qwen_native_batch_disabled && stream && lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
             layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_qwen35_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
         }
-        else if (!qwen_native_batch_disabled && stream && !lw.qwen35_linear && !lw.moe &&
+        else if (!qwen_native_batch_disabled && stream && !lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_full_attn_prefill_layer_batch_native_legacy(lw, xp, l, sp, cnt) || forward_full_attn_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
@@ -12341,7 +13821,7 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
         // the real CPU MTP speedup: the 48 linear layers are most of the compute.
         // (Full-attn layers' batched path is GPU-only, so on CPU they use the
         // per-token loop below — only 16 of 64 layers.)
-        else if (!qwen_native_batch_disabled && !stream && n > 1 && lw.qwen35_linear && !lw.moe &&
+        else if (!qwen_native_batch_disabled && !stream && n > 1 && lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_qwen35_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
@@ -12349,7 +13829,7 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
         // CPU batched path for full-attention layers (the other 16). Their batched
         // function now falls back to cpu::mat_mat for every projection, so it runs
         // on CPU too — all 64 layers batch the n verify tokens in one weight pass.
-        else if (!qwen_native_batch_disabled && !stream && n > 1 && !lw.qwen35_linear && !lw.moe &&
+        else if (!qwen_native_batch_disabled && !stream && n > 1 && !lw.qwen35_linear && (!lw.moe || moe_batch_ok(lw)) &&
                  layer_batch_tiled(x_buf.data(), n, start_pos, hidden, l, [&](float* xp, int sp, int cnt) { return forward_full_attn_prefill_layer_batch_native_legacy(lw, xp, l, sp, cnt) || forward_full_attn_prefill_layer_batch(lw, xp, l, sp, cnt); }))
         {
             handled_by_batched_turbo = true;
@@ -12421,8 +13901,7 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
     if (!mtp_verify_all_logits_) {
     bool lm_done = false;
     if (gpu_lm_head_ && nx_lm_head_gpu_ok(lm_head_type)) {
-        lm_done = gpu::gpu().mat_vec(lm_head_weight, head_in, logits_.data(),
-                                     (size_t)vocab, (size_t)hidden, lm_head_type);
+        lm_done = lm_head_card_matvec(head_in, logits_.data());
     }
     if (!lm_done) {
         cpu::mat_vec(lm_head_weight, head_in, logits_.data(),
@@ -12460,8 +13939,7 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
                    t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64; };
         bool done2 = false;
         if (gpu_lm_head_ && nx_lm_head_gpu_ok(lm_head_type)) {
-            done2 = gpu::gpu().mat_vec(lm_head_weight, head_in2, dst.data(),
-                                       (size_t)vocab, (size_t)hidden, lm_head_type);
+            done2 = lm_head_card_matvec(head_in2, dst.data());
         }
         if (!done2) {
             cpu::mat_vec(lm_head_weight, head_in2, dst.data(),
@@ -12508,8 +13986,8 @@ inline void Transformer::prefill_batch(const std::vector<int32_t>& tokens,
         auto is_native_nqA = [](QuantType t){
             return t == QuantType::NQ4_G64 || t == QuantType::NQ5_G64 ||
                    t == QuantType::NQ6_G64 || t == QuantType::NQ8_G64; };
-        if (mtp_use_gpu_ && gpu::gpu().ready() && is_native_nqA(lm_head_type)) {
-            doneA = gpu::gpu().mat_mat(lm_head_weight, hin_all.data(), Yall.data(),
+        if (mtp_use_gpu_ && lm_card().ready() && is_native_nqA(lm_head_type)) {
+            doneA = lm_card().mat_mat(lm_head_weight, hin_all.data(), Yall.data(),   // the card that holds the lm_head
                                        (size_t)vocab, (size_t)hidden, (size_t)n, lm_head_type);
         }
 #endif
@@ -13679,6 +15157,7 @@ inline bool Transformer::park_setup(int park_layers, int below_mb, int keep_mb, 
     const int nl = (int)layer_weights_.size();
     park_on_ = false; park_pending_ = false;
     park_ranges_.assign(nl, {}); park_state_.assign(nl, 0); park_gpu_w_.assign(nl, {}); park_home_card_.assign(nl, 0);
+    moe_keep_experts_in_ram();      // a MoE layer parks only its attention half: the experts are computed from RAM
     size_t mapped = 0;
     for (auto& r : gguf::nx_direct_ranges())
         if (r.layer >= 0 && r.layer < nl) { park_ranges_[r.layer].push_back({(uint8_t*)r.p, r.n}); mapped += r.n; r.layer = -2; }
@@ -13715,6 +15194,29 @@ inline bool Transformer::park_setup(int park_layers, int below_mb, int keep_mb, 
     park_prefill_free_bytes_ = (size_t)std::max(0, prefill_free_mb) << 20;
     park_min_tokens_         = std::max(0, min_tokens);
 
+    {   // Parking owns this card from here on.  Anything a layer count put on it the static way is handed back first,
+        // so the two do not each half-fill it (before, both ran and the card ended up part full with neither in
+        // charge).  With Maximize GPU the count is ignored outright; without it the count becomes how many layers
+        // parking manages, so they can still leave the card for the prompt and come back for the reply.
+        int released = 0; size_t freed = 0;
+        for (int l = 0; l < nl && l < (int)primary_card_w_.size(); ++l) {
+            auto& lw = layer_weights_[l];
+            if (!lw.gpu_layer || lw.gpu2_layer || lw.gpux >= 0 || primary_card_w_[(size_t)l].empty()) continue;
+            gpu::gpu().wait_idle();
+            for (const void* w : primary_card_w_[(size_t)l]) { gpu::gpu().unpin_weight_public(w); gpu::gpu().evict_weight_public(w); }
+            freed += turbo_layer_weight_bytes(l);
+            primary_card_w_[(size_t)l].clear();
+            lw.gpu_layer = false; ++released;
+        }
+        if (released) {
+            gpu::gpu().set_weight_cache_budget(0);
+            n_gpu_layers_ = 0; gpu::gpu().set_gpu_layers(0);
+            fprintf(stderr, "[park] the %d layers (%zu MB) a layer count had put on the card are handed back; %s decides what the card "
+                            "holds from here, so they can leave it while a prompt is read and come back for the reply\n",
+                    released, freed >> 20, park_layers < 0 ? "Maximize GPU" : "parking");
+            fflush(stderr);
+        }
+    }
     int want = park_layers;
     if (want < 0) {                                    // as many as fit on the card (what is really free on it, when the driver says)
         const size_t room = park_card_room();
@@ -13981,6 +15483,47 @@ inline void Transformer::park_watch() {
 
 // Card memory free for more layers. With VK_EXT_memory_budget this is what the driver says is really free (the
 // desktop and every Nexus buffer included) minus the kept-free amount; otherwise an estimate from the card's size.
+inline void Transformer::report_cards(const char* when) const {
+#if defined(NEXUS_VULKAN)
+    auto one = [&](gpu::VulkanBackend& g, int card_no) {
+        if (!g.ready()) return;
+        const auto gi = g.info();
+        if (gi.vram_bytes == 0) return;
+        size_t fr = 0; const bool real = g.vram_free_now(fr);
+        const size_t total = (size_t)gi.vram_bytes;
+        const size_t w = g.weight_cache_used(), kv = g.kv_mirror_used();
+        // what the card holds that is neither weights nor the conversation mirror: the prompt working space, the
+        // writing buffers, the desktop.  If this is large after a prompt, the prompt's working space is still held.
+        const size_t acc = w + kv;
+        const size_t used = real && total > fr ? total - fr : acc;
+        const size_t other = used > acc ? used - acc : 0;
+        int resident = 0, in_ram = 0, on_drive = 0;
+        for (size_t l = 0; l < layer_weights_.size(); ++l) {
+            const auto& lw = layer_weights_[l];
+            const bool mine = card_no == 1 ? (lw.gpu_layer || (park_on_ && l < park_state_.size() && park_state_[l] == 2))
+                                           : (card_no == 2 ? lw.gpu2_layer : lw.gpux == card_no - 1);
+            if (mine) ++resident;
+            else if (card_no == 1 && park_on_ && l < park_state_.size()) { if (park_state_[l] == 1) ++on_drive; else ++in_ram; }
+        }
+        fprintf(stderr, "[card %d] %s: %s of %zu MB free%s -- layers %zu MB (%d of %d on it%s), conversation memory %zu MB, "
+                        "other buffers (prompt working space, writing buffers, desktop) %zu MB\n",
+                card_no, gi.device_name.c_str(), real ? (std::to_string(fr >> 20) + " MB").c_str() : "unknown", total >> 20,
+                real ? "" : " (this driver does not report it)", w >> 20, resident, (int)layer_weights_.size(),
+                (card_no == 1 && park_on_) ? (", " + std::to_string(in_ram) + " in RAM, " + std::to_string(on_drive) + " read from the model file").c_str() : "",
+                kv >> 20, other >> 20);
+        if (card_no == 1 && park_on_)
+            fprintf(stderr, "[card 1] of that free memory, %zu MB is kept free on purpose (--park-keep-mb%s) -- room for more layers: %zu MB\n",
+                    (park_keep_bytes_ + mtp_reserve_bytes_) >> 20, mtp_reserve_bytes_ ? " plus the MTP reserve" : "", park_card_room() >> 20);
+    };
+    fprintf(stderr, "[card] what the cards hold %s:\n", when);
+    one(gpu::gpu(), 1);
+    if (gpu2_) one(*gpu2_, 2);
+    for (size_t i = 0; i < gpux_.size(); ++i) if (gpux_[i]) one(*gpux_[i], (int)i + 3);
+    fflush(stderr);
+#else
+    (void)when;
+#endif
+}
 inline size_t Transformer::park_card_room() const {
 #if defined(NEXUS_VULKAN)
     auto& g = gpu::gpu();
@@ -14113,6 +15656,7 @@ inline void Transformer::park_finish_pending() {
     }
 #endif
     park_to_gpu("prompt read");
+    report_cards("now the prompt has been read and the layers are back");
 #if defined(__linux__)
     // Everything the card couldn't take goes into RAM. No floor and no drive fallback: with the memory safety
     // buffer off, running out of RAM is the user's call to make (the safety buffer, when on, stops a reply first).

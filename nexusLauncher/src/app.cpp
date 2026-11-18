@@ -38,10 +38,10 @@ const char* const MODEL_FIELDS[] = {
     "imgSize", "upEdge", "upPx", "tileSize", "tileStride", "maxTiles", "loraScale", "mtpN", "extraArgs", "extraEnv", "startState",
     "ctPre", "ctPreSys", "ctEndSys", "ctPreUser", "ctEndUser", "ctPreModel", "ctEndModel",
     "chatFmt", "rope", "norm", "thinking", "preserve", "vMode", "mtp", "mtpGpu", "visionGpu", "lmQ8", "int8", "memGuard", "memBufMb",
-    "distChunk", "hybridPrefill", "hybridMinTok", "ctxLimit", "ctxLimitTok", "autoTrim"};   // distChunk was missing from this list already (pre-existing gap, fixed in passing); hybridPrefill is new; hybridMinTok is new
+    "distChunk", "hybridPrefill", "hybridMinTok", "ctxLimit", "ctxLimitTok", "autoTrim", "sysMode", "sysPrompt"};   // distChunk was missing from this list already (pre-existing gap, fixed in passing); hybridPrefill is new; hybridMinTok is new
 const char* const HW_FIELDS[] = {
     "gpuSel", "gpuLayers", "gpu2Sel", "gpu2Layers", "threads", "myLayers", "prefillMode", "prefillGpu", "vram", "gpuWin", "attnPath", "tokByTok", "profile", "trace",
-    "card1Mode", "card2Mode", "parkProtect", "parkBelowMb", "parkFreeMb", "parkKeepMb", "pfInt8", "tileSplit", "pfBudgetReal", "cpuInt8"};
+    "card1Mode", "card2Mode", "parkProtect", "parkBelowMb", "parkKeepMb", "lmHead", "pfInt8", "tileSplit", "cpuInt8", "moeExperts", "moeHome"};
 
 // graphics cards: card 1 and 2 keep their old setting names, card 3, 4, ... are gpu3Sel / gpu3Layers ... (no upper limit that matters)
 const int kMaxCards = 16;
@@ -65,7 +65,8 @@ std::string dflt(const std::string& k) {
         {"ctxLimit", "max"}, {"ctxLimitTok", "32768"}, {"autoTrim", "1"},
         {"gpuSel", "cpu"}, {"gpuLayers", "0"}, {"gpu2Sel", "none"}, {"gpu2Layers", "0"}, {"vram", "0"}, {"gpuWin", "1"}, {"attnPath", "auto"}, {"trace", "0"},
         {"prefillMode", "auto"}, {"tokByTok", "0"}, {"profile", "0"},
-        {"card1Mode", "keep"}, {"card2Mode", "keep"}, {"parkProtect", "0"}, {"parkBelowMb", "1024"}, {"parkFreeMb", ""}, {"parkKeepMb", "768"}, {"pfInt8", "auto"}, {"tileSplit", "auto"}, {"pfBudgetReal", "1"}, {"cpuInt8", "0"}};
+        {"card1Mode", "keep"}, {"card2Mode", "keep"}, {"parkProtect", "0"}, {"parkBelowMb", "1024"}, {"parkKeepMb", "768"}, {"lmHead", "first"}, {"pfInt8", "auto"}, {"tileSplit", "auto"}, {"cpuInt8", "0"},
+        {"moeExperts", "prompt"}, {"moeHome", "all"}};
     auto it = d.find(k); return it == d.end() ? std::string() : it->second;
 }
 
@@ -314,6 +315,11 @@ bool park_max_on(Slot& sl) {
     const auto it = sl.S.find("card1Mode");
     return it != sl.S.end() && it->second == "max";
 }
+// THE one card-memory number: "GPU prompt processing space" (MB).  Card memory that is never filled with layers; it is
+// kept free for reading prompts, for the conversation's attention and for anything else on the card (the desktop).
+// It is what decides how many layers go on a card: what the card really has free, minus this, whole layers only --
+// a layer that would go over is left off.  Every card obeys it, on Maximize GPU or on a set number of layers.
+int gpu_space_mb(Slot& sl) { const int v = atoi(val(sl, "parkKeepMb").c_str()); return v > 0 ? std::max(64, v) : 768; }
 bool prefill_on(Slot& sl) {
     if (g_pgpus.empty() || sl.S["prefillGpu"].empty()) return false;
     const std::string m = sl.S["prefillMode"];
@@ -545,10 +551,9 @@ bool build_start(int idx, std::vector<std::string>& a, std::vector<std::pair<std
     a.push_back("--threads"); a.push_back(std::to_string(std::max(1, atoi(V("threads").c_str()))));
     // graphics cards
     const std::string gpu = sl.S["gpuSel"];
-    // Maximize GPU: card 1's layers live on it for writing but are not "kept" there the usual way -- the engine parks
-    // them, and the card is (partly) cleared for the prompt speed-up while a long prompt is read. Needs the speed-up.
-    const bool park_max = park_max_on(sl);
-    const bool pf = prefill_on(sl) || park_max;
+    // Layers move off a card while a prompt is read ONLY when the prompt speed-up is on. With it off, whatever layers
+    // were asked for are loaded and stay put -- Maximize GPU just fills the card and leaves it filled.
+    const bool pf = prefill_on(sl);
     // The cards as listed in "Run on graphics card(s)": device, layers, and whether it is set to Maximize GPU.
     struct CardEnt { std::string dev; int layers; bool max; };
     std::vector<CardEnt> cards;
@@ -569,10 +574,16 @@ bool build_start(int idx, std::vector<std::string>& a, std::vector<std::pair<std
         if (!first_seen && c.dev == first) { first_seen = true; first_layers = c.layers; first_max = c.max; continue; }
         if (c.max || c.layers > 0) others.push_back(c);
     }
-    // Maximize on the prompt card = parking: its layers live there for writing and move off just enough while a prompt
-    // is read. Maximize on any other card = as many layers as fit, kept there for writing ("auto").
+    // Maximize on the prompt card with the speed-up on = parking: its layers live there for writing and move off just
+    // enough while a prompt is read. Maximize anywhere else = as many layers as fit, kept there ("auto").
+    // A set number is sent exactly as it was typed -- never trimmed to what fits. More than fits spills: the extra
+    // layers run on the card reading their weights from system RAM, and whatever is left over runs on the CPU.
+    // Card 1 ALWAYS states its own share first, parked or not. It used to be sent 0 when it was going to be parked,
+    // which let card 2's "auto" start at layer 0 and swallow the whole model -- the prompt card was left with two
+    // layers and 2.4 GB of it empty. Card 1 fills first, card 2 takes the layers after it, and the server parks
+    // whatever card 1 ended up with.
     const bool park_first = pf && first_max;
-    a.push_back("--gpu-layers"); a.push_back(park_first ? "0" : std::to_string(first_layers));
+    a.push_back("--gpu-layers"); a.push_back(first_max ? "auto" : std::to_string(first_layers));
     if (!first.empty()) { a.push_back("--gpu-device"); a.push_back(gpu_arg(first)); }
     for (size_t k = 0; k < others.size(); ++k) {          // second card, then 3, 4, ...
         const std::string flag = k == 0 ? "--gpu2" : "--gpu" + std::to_string(k + 2);
@@ -609,27 +620,34 @@ bool build_start(int idx, std::vector<std::string>& a, std::vector<std::pair<std
         if (V("attnPath") != "auto") E("NEXUS_ATTN_PATH", V("attnPath"));
         if (V("tileSplit") == "1") E("NEXUS_PREFILL_TILE_MAX_S", "3");        // split long prompt steps: on (any card)
         else if (V("tileSplit") == "0") E("NEXUS_PREFILL_TILE_MAX_S", "0");   // off (auto: AMD cards only)
-        if (V("pfBudgetReal") == "0") E("NEXUS_TURBO_BUDGET_REAL", "0");     // prompt working space by the card's size (older)
         const bool protect = V("parkProtect") == "1";
-        if (park_first) { a.push_back("--park-layers"); a.push_back("auto"); }
+        // No --park-layers: the server parks exactly what went on card 1, so the two can never disagree.
         if (protect) { a.push_back("--park-below-mb"); a.push_back(std::to_string(std::max(64, atoi(V("parkBelowMb").c_str())))); }
-        if (park_first) {
-            const int fm = atoi(V("parkFreeMb").c_str());
-            a.push_back("--park-prefill-free-mb"); a.push_back(fm > 0 ? std::to_string(fm) : "auto");
-        }
+        // The one number again: this is the room made free on the card before a prompt is read.
+        if (park_first) { a.push_back("--park-prefill-free-mb"); a.push_back(std::to_string(gpu_space_mb(sl))); }
     }
     bool tbt = sl.S["tokByTok"] == "1";
 #ifndef _WIN32
     // Layers sent to a discrete card live in the card's memory ONLY (no second copy in RAM).  The RAM copy is kept only
     // for the prompt speed-up (prefill acceleration), which is the one thing that needs it.  Without a RAM copy the prompt
     // is read through the card, token by token.
-    if (!pf && gpu != "cpu" && gpu == first && !g_gpu_integrated.count(gpu) && atoi(V("gpuLayers").c_str()) > 0) {
+    if (!pf && !first_max && gpu != "cpu" && gpu == first && !g_gpu_integrated.count(gpu) && atoi(V("gpuLayers").c_str()) > 0) {
         E("NEXUS_DIRECT_GPU_LAYERS", std::to_string(atoi(V("gpuLayers").c_str())));
         // The card's size lets the loader read only the layers that fit in place; the rest are loaded page-aligned so the card can still compute them from RAM.
         auto vm = g_gpu_vram_mb.find(gpu); if (vm != g_gpu_vram_mb.end() && vm->second > 0) E("NEXUS_DIRECT_VRAM_MB", std::to_string(vm->second));
     }
 #endif
-    if (any_card_max(sl)) { a.push_back("--park-keep-mb"); a.push_back(std::to_string(std::max(64, atoi(V("parkKeepMb").c_str())))); }
+    // GPU prompt processing space: sent whenever a card is in use at all, because it is what decides how many layers
+    // fit on every card (what the card really has free, minus this), not just under Maximize GPU.
+    if (gpu != "cpu" && !gpu.empty()) { a.push_back("--park-keep-mb"); a.push_back(std::to_string(gpu_space_mb(sl))); }
+    // where the output matrix (lm_head) goes -- read in full for every token, like a layer
+    if (gpu != "cpu" && !gpu.empty()) { const std::string lm = V("lmHead"); a.push_back("--lm-head"); a.push_back(lm == "after" || lm == "cpu" ? lm : "first"); }
+    // mixture-of-experts models: which experts get a copy on the cards (ignored by the server for other models)
+    if (gpu != "cpu" && !gpu.empty()) {
+        const std::string me = V("moeExperts"); const std::string m = (me == "home" || me == "off") ? me : "prompt";
+        a.push_back("--moe-experts"); a.push_back(m);
+        if (m == "home") { std::string h = V("moeHome"); if (h != "all" && atoi(h.c_str()) <= 0) h = "all"; a.push_back("--moe-home"); a.push_back(h); }
+    }
     if (tbt) a.push_back("--prefill-token-by-token");
     if (sl.S["profile"] == "1") E("NEXUS_PREFILL_PROFILE", "1");
     // speed-for-accuracy options: ON by default; unticking asks the server for the exact (slower) form
@@ -644,6 +662,13 @@ bool build_start(int idx, std::vector<std::string>& a, std::vector<std::pair<std
         const char* k[] = {"ctPre", "ctPreSys", "ctEndSys", "ctPreUser", "ctEndUser", "ctPreModel", "ctEndModel"};
         const char* fl[] = {"--chat-custom-pre-prompt", "--chat-custom-pre-system", "--chat-custom-end-system", "--chat-custom-pre-user", "--chat-custom-end-user", "--chat-custom-pre-model", "--chat-custom-end-model"};
         for (int i = 0; i < 7; ++i) { a.push_back(fl[i]); a.push_back(sl.S[k[i]]); }
+    }
+    // System prompt (per model): "own" = the text below, written to a file so any length and any characters survive.
+    // Used whenever a chat sends none; the web chat's own System Prompt box still wins. Empty text = no system prompt.
+    if (sl.S["sysMode"] == "own") {
+        const std::string sp_path = join(join(g_dir, "nexus-data"), "system-prompt-" + std::to_string(port) + ".txt");
+        write_file_atomic(sp_path, sl.S["sysPrompt"]);
+        a.push_back("--system-prompt-file"); a.push_back(sp_path);
     }
     // sampling: every value stated explicitly
     const char* sf[][2] = {{"temp", "--temperature"}, {"topp", "--top-p"}, {"topk", "--top-k"}, {"minp", "--min-p"}, {"tfsz", "--tfs-z"}, {"rep", "--rep-penalty"},
@@ -769,11 +794,56 @@ const char* kNoteTileSplit =
     "Split long prompt steps: if one step of a long prompt takes over 3 s on the card, the rest of that layer runs in smaller "
     "steps, so an AMD card's Linux driver doesn't reset the card (it allows 10 s per job).\n\nOther cards don't need it and "
     "it slows them (smaller steps, slower kernels), so Auto = AMD cards only.";
-const char* kNoteBudget =
-    "Prompt working space on the card: how much of the card the prompt speed-up may fill while a prompt is read.\n\n"
-    "Fit to what's really free: leaves room for the desktop and for long chats (attention needs more room as the "
-    "conversation grows).\nBy the card's size: the older way -- the card's whole memory minus a fixed margin. Fuller; can "
-    "run out on a small card or a long chat.";
+const char* kNoteSysPrompt =
+    "The system prompt is the standing instruction the model sees before every conversation -- who it is and how it should "
+    "behave. It is used whenever a chat doesn't send its own; the System Prompt box in the web chat still wins when you fill "
+    "it in there.\n\n"
+    "The model's usual one: whatever its chat format normally uses. For the Qwen3 format that is \"You are Qwen, created by "
+    "Alibaba Cloud...\" -- but only for a model whose name says Qwen; any other model on that format (your own models, "
+    "fine-tunes) gets \"You are a helpful assistant.\"\n\n"
+    "My own: the text you type, for this model only, any length. Leave it empty to give the model no system prompt at all.";
+const char* kNoteLmHead =
+    "The output matrix (lm_head) turns the model's last result into a score for every word it knows. It is read in full for "
+    "every token you get back -- on Qwen 3.5 that is 248,000 words, about 640 MB on the 9B -- so where it sits matters as "
+    "much as a few layers. While it is on the CPU, the cards also have to stop and wait after every layer, because the "
+    "fast path that runs the layers back to back only switches on when the output matrix is on a card.\n\n"
+    "On the fastest card first: at start-up each card is timed reading weights (the log prints the GB/s), and the output "
+    "matrix goes on the fastest card that has room. If no card has room, the fastest card hands back its last layers to make "
+    "room for it -- only as many as it needs. Those layers then run on the CPU.\n\n"
+    "On a card only if there's room: the same, but no layer is ever moved for it; if no card has room it stays on the CPU.\n\n"
+    "Keep on the CPU: never on a card.\n\n"
+    "A card that is parking (Maximize GPU with the prompt speed-up) is left out, because parking owns that card's memory.";
+const char* kNoteMoeExperts =
+    "Only for mixture-of-experts models (a Qwen3.6-35B-A3B, for example). Other models ignore it.\n\n"
+    "Such a model is mostly experts -- about 95% of a 35B-A3B -- and every token uses only a few of them, so they stay in RAM "
+    "and SOME also get a copy on your cards. The attention part of every layer runs on its card either way. For each token, "
+    "each card runs the chosen experts it holds in one go while the CPU does the rest, at the same time. The shared expert "
+    "(used by every token) always goes on a card first.\n\n"
+    "Picked by each prompt: after a prompt is read, the experts it used most are moved onto the cards and the unused ones make "
+    "room. Re-checked every 256 tokens while writing. Best when one chat stays on one topic. The log line [moe] prompt-picked "
+    "shows how many moved, how long it took, and how much of the work is now on a card.\n\n"
+    "Fixed home: a set chosen at load stays put (see the box next to it). No moving, ever.\n\n"
+    "CPU only: experts never go on a card.\n\n"
+    "Long prompts: any expert picked by 24 or more of the prompt's tokens is sent through the prompt card, so reading the "
+    "prompt gets the card speed-up too. A card that is parking (Maximize GPU) also holds experts; they step aside while a "
+    "prompt is read and come back right after it.";
+const char* kNoteMoeHome =
+    "For Fixed home only. All: every expert of the first layer, then the next layer, and so on, until the cards are full -- "
+    "those layers run entirely on a card. A number, like 32: that many experts of EVERY layer (expert 0 to 31 of each), until "
+    "the cards are full.";
+const char* kNoteGpuSpace =
+    "GPU prompt processing space: the only card memory this launcher holds back. It is never filled with layers -- it is "
+    "there for reading prompts, for the conversation's attention as the chat grows, for writing buffers, and for anything "
+    "else on the card (your desktop).\n\nThis one number decides how many layers go on a card:\n\n    layers that fit = "
+    "(what the card really has free) - this number\n\nwhole layers only, so a layer that would go over is left off. If 8 "
+    "layers would take 2.6 GB and only 2.5 GB is left, 7 layers go on even if that is 2.1 GB.\n\nEvery card obeys it, "
+    "whether it is on Maximize GPU or a set number of layers, and it is also the room freed on the prompt card before a "
+    "long prompt is read.\n\n512-1024 (0.5-1 GB) suits most cards; 768 is the default. Raise it if your desktop runs on "
+    "that card or your chats get very long. Lower it to squeeze in another layer.\n\n"
+    "Maximize GPU measures against this same number, from what the card really has free at that moment. On the prompt "
+    "speed-up card those layers also have no copy in RAM: before a long prompt is read, just enough of them move off to "
+    "free this space -- only if it isn't free already -- and they go back on before the reply, a pause while they load "
+    "from the drive. If MTP drafts on the card, room for it is kept as well. Linux.";
 
 // ───────────────────────────── right-click menu for text boxes ───────────────
 // Every text box gets Cut / Copy / Paste / Delete / Select all on the right mouse button (no keyboard shortcuts needed).
@@ -822,8 +892,9 @@ bool InTextMulti(const char* label, std::string* s, const ImVec2& size, ImGuiInp
     text_menu(id, s, fl, c, true); return c;
 }
 
-bool Txt(const char* id, const char* label, const char* hint = "", const char* note = nullptr, ImGuiInputTextFlags fl = 0) {
-    ImGui::PushID(id); Label(label); ImGui::SetNextItemWidth(-FLT_MIN);
+// note = a short line under the box; info = a long explanation behind a small "?" next to the label (no wall of text)
+bool Txt(const char* id, const char* label, const char* hint = "", const char* note = nullptr, ImGuiInputTextFlags fl = 0, const char* info = nullptr) {
+    ImGui::PushID(id); Label(label); Info(info); ImGui::SetNextItemWidth(-FLT_MIN);
     std::string ph = hint && *hint ? std::string(hint) : dflt(id);
     bool c = InText("##v", &(*g_m)[id], fl, ph.c_str());
     if (note) Hint(note);
@@ -1201,7 +1272,7 @@ void draw_setup_inner(Slot& sl, int idx) {
     if (Card("Run on graphics card(s)")) {
         { Grid g("compute", 3);
           g.next(); Sel("gpuSel", "Graphics card 1", g_gpus);
-          g.next(); ImGui::BeginDisabled(card_max(sl, 1)); { std::string ln1 = layers_note(sl, std::max(0, atoi(sl.S["gpuLayers"].c_str())), sl.S["gpuSel"]); std::string nt = card_max(sl, 1) ? std::string("Maximize GPU: as many as fit.") : "The first N layers stay on this card for good. 0 = none." + (ln1.empty() || sl.S["gpuSel"] == "cpu" ? std::string() : "  " + ln1); Txt("gpuLayers", "Layers kept on card 1", "", nt.c_str()); } ImGui::EndDisabled();
+          g.next(); ImGui::BeginDisabled(card_max(sl, 1)); { std::string ln1 = layers_note(sl, std::max(0, atoi(sl.S["gpuLayers"].c_str())), sl.S["gpuSel"]); std::string nt = card_max(sl, 1) ? std::string("Maximize GPU: as many as fit (this number is ignored).") : "The first N layers go on this card. 0 = none. More than fits is allowed - it spills into system RAM." + (ln1.empty() || sl.S["gpuSel"] == "cpu" ? std::string() : "  " + ln1); Txt("gpuLayers", "Layers kept on card 1", "", nt.c_str()); } ImGui::EndDisabled();
           g.next(); Txt("threads", "CPU threads", "", "For the layers that run on the CPU.");
         }
         if (!sl.auto_note.empty() && (sl.auto_sel.empty() ? sl.S["gpuSel"] == "cpu" : sl.S["gpuSel"] == sl.auto_sel)) Hint(sl.auto_note.c_str());
@@ -1221,7 +1292,7 @@ void draw_setup_inner(Slot& sl, int idx) {
             std::string t1 = "Graphics card " + std::to_string(n), t2 = "Layers kept on card " + std::to_string(n), t3 = "How card " + std::to_string(n) + " holds its layers";
             { Grid g(("compute" + std::to_string(n)).c_str(), 3);
               g.next(); Sel(ks.c_str(), t1.c_str(), gpu_choices(false, true));
-              g.next(); ImGui::BeginDisabled(sl.S[ks] == "none" || card_max(sl, n)); { std::string lnn = sl.S[ks] == "none" ? std::string() : layers_note(sl, std::max(0, atoi(sl.S[kl].c_str())), sl.S[ks]); std::string nt = card_max(sl, n) ? std::string("Maximize GPU: as many as fit.") : (n == 2 ? std::string("Placed right after the layers of card 1.") : std::string()) + (lnn.empty() ? "" : "  " + lnn); Txt(kl.c_str(), t2.c_str(), "", nt.empty() ? nullptr : nt.c_str()); } ImGui::EndDisabled();
+              g.next(); ImGui::BeginDisabled(sl.S[ks] == "none" || card_max(sl, n)); { std::string lnn = sl.S[ks] == "none" ? std::string() : layers_note(sl, std::max(0, atoi(sl.S[kl].c_str())), sl.S[ks]); std::string nt = card_max(sl, n) ? std::string("Maximize GPU: as many as fit (this number is ignored).") : (n == 2 ? std::string("Placed right after the layers of card 1. More than fits spills into system RAM.") : std::string()) + (lnn.empty() ? "" : "  " + lnn); Txt(kl.c_str(), t2.c_str(), "", nt.empty() ? nullptr : nt.c_str()); } ImGui::EndDisabled();
               g.next(); ImGui::BeginDisabled(sl.S[ks] == "none" || g_gpu_integrated.count(sl.S[ks]) > 0); Sel(km.c_str(), t3.c_str(), {{"keep", "A set number"}, {"max", "Maximize GPU: as many as fit"}}); ImGui::EndDisabled();
               g.next(); ImGui::BeginDisabled(sl.S[ks] == "none"); { const std::string k = cardI8(n), t4 = "8-bit prompt math on card " + std::to_string(n); sl.S[k] = i8val(sl.S[k]); Sel(k.c_str(), t4.c_str(), {{"auto", "Auto (measured on the card)"}, {"1", "On"}, {"0", "Off"}}, kNoteCardI8); } ImGui::EndDisabled(); }
             if (sl.S[ks] == "none") break;
@@ -1229,16 +1300,11 @@ void draw_setup_inner(Slot& sl, int idx) {
             int ln = std::max(0, atoi(sl.S[kl].c_str()));
             if (ln > 0) { if (!plan.empty()) plan += "   |   "; plan += "card " + std::to_string(n) + ": layers " + std::to_string(placed) + "-" + std::to_string(placed + ln - 1); placed += ln; }
         }
-        if (any_card_max(sl)) {
-            { Grid g("maxset", 3);
-              g.next(); Txt("parkKeepMb", "Card memory always kept free (MB)", "768");
-              g.next(); Txt("parkFreeMb", "Prompt card: memory for reading a prompt (MB)", "auto"); }
-            Hint("Maximize GPU fills a card with as many layers as fit for writing, measured from what the card really has free, keeping the "
-                 "amount above free (raise it if your desktop runs on that card). If MTP drafts on the card, room for it is kept too. On the prompt speed-up card, "
-                 "those layers also have no copy in RAM: before a prompt is read, just enough of them move off to give the prompt speed-up its "
-                 "room (auto, or the number above) -- only if that room isn't free already -- and they go back on before the reply, a pause "
-                 "while they load from the drive. Linux.");
-        }
+        if (any_card) { Grid g("gpuspace", 3);
+            g.next(); Txt("parkKeepMb", "GPU prompt processing space (MB)", "768", nullptr, 0, kNoteGpuSpace);
+            g.next(); Sel("lmHead", "Output matrix (lm_head)", {{"first", "On the fastest card first"}, {"after", "On a card only if there's room"}, {"cpu", "Keep on the CPU"}}, kNoteLmHead);
+            g.next(); Sel("moeExperts", "Experts on the cards (MoE models)", {{"prompt", "Picked by each prompt"}, {"home", "Fixed home"}, {"off", "CPU only"}}, kNoteMoeExperts);
+            if (sl.S["moeExperts"] == "home") { g.next(); Txt("moeHome", "Home experts per layer", "all", nullptr, 0, kNoteMoeHome); } }
         if (any_card && (placed > 0 || any_card_max(sl))) {
             std::string t = "Plan: " + plan;
             if (sl.meta.layers > 0) t += placed >= sl.meta.layers ? "   |   the whole model (" + std::to_string(sl.meta.layers) + " layers) is on cards" : "   |   layers " + std::to_string(placed) + "-" + std::to_string(sl.meta.layers - 1) + ": CPU";
@@ -1258,8 +1324,7 @@ void draw_setup_inner(Slot& sl, int idx) {
           g.next(); Txt("gpuWin", "Layers swapped through the card at once", "");
           g.next(); Sel("attnPath", "Attention path", {{"auto", "Auto (short prompts batch)"}, {"stream", "Stream"}, {"batch", "Batch"}});
           if (prompt_card_row(sl) == 0) { g.next(); sl.S["pfInt8"] = i8val(sl.S["pfInt8"]); Sel("pfInt8", "8-bit prompt math on this card", {{"auto", "Auto (measured on the card)"}, {"1", "On"}, {"0", "Off"}}, kNoteCardI8); }
-          g.next(); Sel("tileSplit", "Split long prompt steps", {{"auto", "Auto (AMD cards only)"}, {"1", "On (any card)"}, {"0", "Off"}}, kNoteTileSplit);
-          g.next(); Sel("pfBudgetReal", "Prompt working space on the card", {{"1", "Fit to what's really free (safer)"}, {"0", "By the card's size (older, fuller)"}}, kNoteBudget); }
+          g.next(); Sel("tileSplit", "Split long prompt steps", {{"auto", "Auto (AMD cards only)"}, {"1", "On (any card)"}, {"0", "Off"}}, kNoteTileSplit); }
         if (const int pr = prompt_card_row(sl))
             Hint(("8-bit prompt math for this card is set on card " + std::to_string(pr) + " in \"Run on graphics card(s)\".").c_str());
         if (g_pgpus.empty()) Hint("No graphics card was found on this computer.");
@@ -1267,7 +1332,7 @@ void draw_setup_inner(Slot& sl, int idx) {
             Hint("Prompts are read on the card chosen here. Layers you gave this card above stay on it for writing (the prompt is "
                  "read through them in place); the other cards keep theirs for writing, and their layers stream through this card "
                  "while a prompt is read.");
-        {   const bool can = prefill_on(sl) || park_max_on(sl);
+        {   const bool can = prefill_on(sl);
             ImGui::BeginDisabled(!can);
             { Grid g("park", 3);
               g.next(); Sel("parkProtect", "Oversized-prompt protection", {{"0", "Off"}, {"1", "On"}});
@@ -1277,7 +1342,8 @@ void draw_setup_inner(Slot& sl, int idx) {
                        "dropped from RAM (the ones already finished for this prompt first), are read from the model file if still needed, and go onto "
                        "the card for writing after the prompt -- a pause while they load from the drive. Layers that don't fit on the card go back into "
                        "RAM if there is room. Later prompts get the card's room back automatically when they need it. Linux."
-                     : "Oversized-prompt protection and Maximize GPU need the prompt speed-up on.");
+                     : "Needs the prompt speed-up on. With it off, nothing is ever taken off a card: the layers you asked for are "
+                       "loaded and stay there, Maximize GPU included.");
         }
     }
     if (Card("Share with other computers (donors)")) draw_peers(sl);
@@ -1295,6 +1361,14 @@ void draw_setup_inner(Slot& sl, int idx) {
           g.next(); Sel("preserve", "Keep earlier thinking", {{"", "Model decides"}, {"1", "Keep"}, {"0", "Drop"}});
           ImGui::EndDisabled(); }
         if (!think_ok) Hint("This model's chat template has no thinking switch, so the two thinking settings do nothing.");
+        { Grid g("sys", 3);
+          g.next(); Sel("sysMode", "System prompt", {{"", "The model's usual one"}, {"own", "My own (below)"}}, kNoteSysPrompt); }
+        if (sl.S["sysMode"] == "own") {
+            ImGui::PushID("sysp");
+            if (InTextMulti("##v", &sl.S["sysPrompt"], ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5.0f))) changed();
+            ImGui::PopID();
+            if (trim(sl.S["sysPrompt"]).empty()) Hint("Empty: this model gets no system prompt at all.");
+        }
         if (eff == "Custom") {
             Label("Custom chat template - the text placed around each part of the conversation");
             { Grid g("ct", 2);

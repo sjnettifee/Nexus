@@ -351,6 +351,12 @@ public:
 
     // Recommended default system prompt (empty = none needed)
     std::string default_system_prompt() const;
+    // The launcher's system prompt: used whenever a chat sends none (any chat format). Empty = no system prompt at all.
+    void set_system_prompt(const std::string& text);
+    // Mixture-of-experts models: which experts get a copy on the cards. mode 0 = none (CPU), 1 = home (a fixed set placed at
+    // load: home_n experts per layer, or -1 = every expert of as many layers as fit), 2 = prompt-picked (the experts each prompt
+    // used move onto the cards after it is read). Call before the first forward pass.
+    void set_moe_experts(int mode, int home_n);
 
     // Whether BOS token should be prepended to the prompt (format-dependent)
     bool should_add_bos() const;

@@ -458,6 +458,7 @@ public:
     // when the card has no valid copy yet, and the host is told to refresh with q35_state_download() before it touches them again.
     struct Q35LinearDesc {
         const void* owner = nullptr; int layer = 0;
+        bool attn_only = false;   // MoE layers: stop after the attention residual; the experts run separately (moe_experts_run)
         uint32_t hidden = 0, conv_dim = 0, key_dim = 0, value_dim = 0, kh = 0, vh = 0, hd = 0, kernel = 0, ffn = 0;
         float norm_eps = 1e-6f;
         const void* attn_norm = nullptr;
@@ -489,6 +490,7 @@ public:
     // when the layer can't run this way (no mirror budget, missing pipeline, ...): the caller then uses the CPU path.
     struct Q35FullDesc {
         const void* owner = nullptr; int layer = 0;
+        bool attn_only = false;   // MoE layers: stop after the attention residual; the experts run separately (moe_experts_run)
         uint32_t hidden = 0, n_heads = 0, n_kv = 0, hd = 0, rot = 0, ffn = 0, pos = 0;
         float norm_eps = 1e-6f, scale = 0.f;
         const void* attn_norm = nullptr;
@@ -512,6 +514,20 @@ public:
         uint32_t host_synced = 0;                        // host promises tokens [0, host_synced) are unchanged since the mirror was last filled
     };
     bool q35_full_layer(const Q35FullDesc& d, float* x, float* kv_out_host /* [2*n_kv*hd] */, uint32_t* mirror_valid_out, int async_kv_slot = -1);
+
+    // ── Mixture-of-experts: several experts in ONE submit ───────────────────────────────────────────────────────────────────────
+    // Each job is one expert (or the shared expert): out_j = down_j( silu(gate_j x) * (up_j x) ). x is the FFN-normed hidden state;
+    // the router weights are applied by the caller (host side, a handful of multiply-adds). Every weight must already be on this card
+    // (the caller only sends experts it has placed here), so nothing is uploaded while recording.
+    struct MoeJob {
+        const void* gate = nullptr; QuantType gate_t{};
+        const void* up   = nullptr; QuantType up_t{};
+        const void* down = nullptr; QuantType down_t{};
+        uint32_t ffn = 0;
+    };
+    static constexpr int kMoeMaxJobs = 64;
+    bool moe_experts_run(const MoeJob* jobs, int n, const float* xn, uint32_t hidden, float* out /* [n][hidden] */);
+    GpuBuffer moe_g_[kMoeMaxJobs]{}, moe_u_[kMoeMaxJobs]{}, moe_o_[kMoeMaxJobs]{};
     // ---- layer chaining (async submit) ------------------------------------------------------------------------------------------------
     // With async=true the layer is recorded and submitted WITHOUT waiting; the hidden state stays in act_hidden_ between layers, so the CPU records layer N+1
     // while the GPU runs layer N.  The first async layer uploads x (chain opens); chain_end() waits for everything and copies the hidden state back.
@@ -648,6 +664,9 @@ public:
     // loaded synchronously later), and the copy runs on the transfer queue.
     bool load_weight_async_public(const void* W, size_t W_size, QuantType qt, bool pin_after_load = true);
     void pin_weight_public(const void* W);
+    // Qwen 3.5 linear attention: the model's value heads are in llama.cpp's TILED order (k0v0 k1v0 .. k0v1 k1v1 ..), so a
+    // value head's key head is hv % kh, not hv / repeat. Set by the model for every card it uses.
+    void set_q35_v_tiled(bool on) { q35_v_tiled_ = on; }
     void unpin_weight_public(const void* W);
     bool evict_weight_public(const void* W);
     // bytes the cache holds for this weight (0 = not resident)
@@ -794,6 +813,7 @@ private:
     Pipeline pipe_mm_nq8g64_{};
     Pipeline pipe_q35_conv_{};    // Qwen3Next depthwise causal conv full-prompt
     Pipeline pipe_q35_scan_{};    // Qwen3Next GatedDeltaNet recurrent scan full-prompt
+    bool q35_v_tiled_ = false;    // value heads in llama.cpp's tiled order (key head = hv % kh); see set_q35_v_tiled
     Pipeline pipe_q35_scan_r_{};  // same, register-resident state (head_dim == 128 only)
     Pipeline pipe_q35_conv_step_{};   // one-token conv with in-place state shift (decode)
     struct Q35DevState { GpuBuffer conv{}, rec{}; size_t conv_n = 0, rec_n = 0; };
@@ -3059,7 +3079,7 @@ inline bool VulkanBackend::qwen35_scan(const float* conv_out,
     vkCmdPipelineBarrier(reuse_cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, (uint32_t)bars.size(), bars.data(), 0, nullptr);
 
     struct ScanPC { uint32_t n_tokens, conv_dim, key_dim, value_dim, kh, vh, hd, repeat, grouped; float eps; } pc{
-        n_tokens, conv_dim, key_dim, value_dim, kh, vh, hd, repeat, grouped_layout ? 1u : 0u, eps
+        n_tokens, conv_dim, key_dim, value_dim, kh, vh, hd, repeat, grouped_layout ? 1u : (q35_v_tiled_ ? 2u : 0u), eps
     };
     vkCmdBindPipeline(reuse_cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, scan_pipe.pipeline);
     vkCmdBindDescriptorSets(reuse_cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, scan_pipe.layout, 0, 1, &ds, 0, nullptr);
@@ -4993,11 +5013,13 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
     const bool reg = (d.hd == 128 && pipe_q35_scan_r_.pipeline);
     const Pipeline& scan_pipe = reg ? pipe_q35_scan_r_ : pipe_q35_scan_;
     if (!scan_pipe.pipeline || d.hd == 0 || d.hd > 256 || d.vh == 0 || d.kh == 0 || d.vh % d.kh != 0 || d.kernel < 1) return false;
-    if (d.hidden == 0 || d.conv_dim == 0 || d.value_dim == 0 || d.key_dim == 0 || d.ffn == 0) return false;
+    if (d.hidden == 0 || d.conv_dim == 0 || d.value_dim == 0 || d.key_dim == 0 || (d.ffn == 0 && !d.attn_only)) return false;
     if (d.conv_dim != 2 * d.key_dim + d.value_dim || d.value_dim != d.vh * d.hd || d.key_dim != d.kh * d.hd) return false;
-    if (!d.attn_norm || !d.ffn_norm || !d.qkv || !d.z || !d.a || !d.b || !d.out || !d.gate || !d.up || !d.down || !d.conv_w || !d.A || !d.dt || !d.gnorm) return false;
+    if (!d.attn_norm || !d.qkv || !d.z || !d.a || !d.b || !d.out || !d.conv_w || !d.A || !d.dt || !d.gnorm) return false;
+    if (!d.attn_only && (!d.ffn_norm || !d.gate || !d.up || !d.down)) return false;
     if (!act_bufs_ok() || !act_hidden_.mapped_ptr) return false;
-    if (act_xb_.size < (size_t)d.hidden * 4 || act_gate_.size < (size_t)d.ffn * 4 || act_up_.size < (size_t)d.ffn * 4 || act_ffn_out_2_.size < (size_t)d.hidden * 4) return false;
+    if (act_xb_.size < (size_t)d.hidden * 4 || act_ffn_out_2_.size < (size_t)d.hidden * 4) return false;
+    if (!d.attn_only && (act_gate_.size < (size_t)d.ffn * 4 || act_up_.size < (size_t)d.ffn * 4)) return false;
 
     const size_t hist = d.kernel - 1;
     const size_t conv_n = (size_t)d.conv_dim * hist, rec_n = (size_t)d.vh * d.hd * d.hd;
@@ -5007,6 +5029,7 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
     const W mats[] = { {d.qkv, d.conv_dim, d.hidden, d.qkv_t}, {d.z, d.value_dim, d.hidden, d.z_t}, {d.a, d.vh, d.hidden, d.a_t}, {d.b, d.vh, d.hidden, d.b_t},
                        {d.out, d.hidden, d.value_dim, d.out_t}, {d.gate, d.ffn, d.hidden, d.gate_t}, {d.up, d.ffn, d.hidden, d.up_t}, {d.down, d.hidden, d.ffn, d.down_t} };
     for (const W& m : mats) {
+        if (d.attn_only && (m.p == d.gate || m.p == d.up || m.p == d.down)) continue;   // MoE: no dense FFN in this submit
         Pipeline* pp = pipeline_for(m.t);
         size_t bytes = 0; uint32_t nb = 0;
         if (!pp || !pp->pipeline || !size_for(m.t, m.rows, m.cols, bytes, nb)) return false;
@@ -5014,7 +5037,7 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
     }
     const struct { const void* p; size_t n; } vecs[] = { {d.attn_norm, (size_t)d.hidden}, {d.ffn_norm, (size_t)d.hidden}, {d.conv_w, (size_t)d.conv_dim * d.kernel},
                                                          {d.A, d.vh}, {d.dt, d.vh}, {d.gnorm, d.hd} };
-    for (auto& v : vecs) if (!get_weight_buffer(v.p, v.n * sizeof(float), QuantType::F32).buffer) return false;
+    for (auto& v : vecs) { if (!v.p && d.attn_only) continue; if (!get_weight_buffer(v.p, v.n * sizeof(float), QuantType::F32).buffer) return false; }
 
     // scratch (device local) and per-layer state
     auto ensure_dev = [&](GpuBuffer& gb, size_t need) -> bool {
@@ -5069,6 +5092,8 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
                                   (uint64_t)d.out_t, (uint64_t)d.gate_t, (uint64_t)d.up_t, (uint64_t)d.down_t };
         for (uint64_t v : nums) mix(v);
         uint32_t eb; std::memcpy(&eb, &d.norm_eps, 4); mix(eb);
+        mix(q35_v_tiled_ ? 2u : 0u);                         // a recording made for the other head order is not reused
+        mix(d.attn_only ? 7u : 0u);                          // attention-only (MoE) recordings are their own entries
         Q35LinCache& c = q35_lin_cache_[key];
         if (c.cmd && c.gen == buf_gen_ && c.sig == sig) {                 // hit: resubmit the recorded buffer
             ++lin_cache_hits_;
@@ -5123,7 +5148,7 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
             VkBuffer bufs[9] = { q35_t_cout_.buffer, q35_t_a_.buffer, q35_t_b_.buffer, q35_t_z_.buffer, A.buffer, dt.buffer, gn.buffer, st.rec.buffer, q35_t_core_.buffer };
             rec_bind_bufs(device_, ds, bufs, 9);
             struct { uint32_t n_tokens, conv_dim, key_dim, value_dim, kh, vh, hd, repeat, grouped; float eps; } pc{
-                1u, d.conv_dim, d.key_dim, d.value_dim, d.kh, d.vh, d.hd, d.vh / d.kh, 0u, d.norm_eps };
+                1u, d.conv_dim, d.key_dim, d.value_dim, d.kh, d.vh, d.hd, d.vh / d.kh, q35_v_tiled_ ? 2u : 0u, d.norm_eps };
             layer_dispatch(layer_cmd_, scan_pipe.pipeline, scan_pipe.layout, ds, &pc, sizeof(pc), d.vh);
         }
     }
@@ -5133,6 +5158,7 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
     layer_barrier("out matvec");
     ok &= record_add_g(act_hidden_, act_ffn_out_2_, d.hidden);
     layer_barrier("residual add");
+    if (!d.attn_only) {
     ok &= record_rms_norm_g(act_hidden_, d.ffn_norm, hb, act_xb_, d.hidden, d.norm_eps);
     layer_barrier("ffn norm");
     record_quant_act_g(act_xb_, d.hidden);
@@ -5145,6 +5171,7 @@ inline bool VulkanBackend::q35_linear_layer(const Q35LinearDesc& d, float* x, co
     ok &= record_mat_vec_g(d.down, d.down_t, act_gate_, act_ffn_out_2_, d.hidden, d.ffn);
     layer_barrier("down matvec");
     ok &= record_add_g(act_hidden_, act_ffn_out_2_, d.hidden);
+    }
 
     if (!ok) {
         const bool was_async = chain_async_; chain_async_ = false;
@@ -5189,6 +5216,59 @@ inline void VulkanBackend::q35_kv_drop(const void* owner, int layer) {
     }
 }
 
+inline bool VulkanBackend::moe_experts_run(const MoeJob* jobs, int n, const float* xn, uint32_t hidden, float* out) {
+    if (!ready_ || layer_recording_ || !jobs || n <= 0 || n > kMoeMaxJobs || !xn || !out || hidden == 0 || !rec_pool_ || !layer_cmd_) return false;
+    if (!act_bufs_ok() || !act_xb_.mapped_ptr || act_xb_.size < (size_t)hidden * 4) return false;
+    if (!pipe_silu_.pipeline) return false;
+    // every weight resident BEFORE recording (they were placed on this card on purpose; this only looks them up)
+    for (int j = 0; j < n; ++j) {
+        const MoeJob& J = jobs[j];
+        if (!J.gate || !J.up || !J.down || J.ffn == 0) return false;
+        const struct { const void* p; size_t r, c; QuantType t; } m[3] = { {J.gate, J.ffn, hidden, J.gate_t}, {J.up, J.ffn, hidden, J.up_t}, {J.down, hidden, J.ffn, J.down_t} };
+        for (auto& w : m) {
+            Pipeline* pp = pipeline_for(w.t); size_t bytes = 0; uint32_t nb = 0;
+            if (!pp || !pp->pipeline || !size_for(w.t, w.r, w.c, bytes, nb)) return false;
+            if (!get_weight_buffer(w.p, bytes, w.t).buffer) return false;
+        }
+    }
+    // per-job scratch: gate/up on the card, the outputs host-visible so they come back without a copy pass
+    auto ensure = [&](GpuBuffer& b, size_t bytes, bool host) -> bool {
+        bytes = std::max<size_t>(bytes, 16);
+        if (b.buffer && b.size >= bytes) return true;
+        if (b.buffer) { device_idle_locked(); if (b.mapped_ptr) { vkUnmapMemory(device_, b.memory); b.mapped_ptr = nullptr; } free_buffer(b); }
+        b = alloc_buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         host ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!b.buffer || !b.memory) return false;
+        if (host && vkMapMemory(device_, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped_ptr) != VK_SUCCESS) { b.mapped_ptr = nullptr; return false; }
+        return true;
+    };
+    for (int j = 0; j < n; ++j)
+        if (!ensure(moe_g_[j], (size_t)jobs[j].ffn * 4, false) || !ensure(moe_u_[j], (size_t)jobs[j].ffn * 4, false) || !ensure(moe_o_[j], (size_t)hidden * 4, true)) return false;
+
+    memcpy(act_xb_.mapped_ptr, xn, (size_t)hidden * 4);
+    begin_layer_record(nullptr, hidden);
+    if (!layer_recording_) return false;
+    bool ok = true;
+    record_quant_act_g(act_xb_, hidden);                                  // int8 kernels when the card has them; harmless otherwise
+    for (int j = 0; j < n; ++j) {
+        ok &= record_mat_vec_g(jobs[j].gate, jobs[j].gate_t, act_xb_, moe_g_[j], jobs[j].ffn, hidden);
+        ok &= record_mat_vec_g(jobs[j].up,   jobs[j].up_t,   act_xb_, moe_u_[j], jobs[j].ffn, hidden);
+    }
+    layer_barrier("experts gate+up");
+    for (int j = 0; j < n; ++j) ok &= record_silu_mul_g(moe_g_[j], moe_u_[j], jobs[j].ffn);
+    layer_barrier("experts silu*up");
+    for (int j = 0; j < n; ++j) {
+        record_quant_act_g(moe_g_[j], jobs[j].ffn);                       // one quantised input at a time: the scratch is shared
+        ok &= record_mat_vec_g(jobs[j].down, jobs[j].down_t, moe_g_[j], moe_o_[j], hidden, jobs[j].ffn);
+        layer_barrier("expert down");
+    }
+    if (!ok) { end_layer_record(nullptr, 0); return false; }
+    float dummy = 0.0f;
+    end_layer_record(&dummy, 0);                                          // submit + wait; nothing to copy from act_hidden_
+    for (int j = 0; j < n; ++j) memcpy(out + (size_t)j * hidden, moe_o_[j].mapped_ptr, (size_t)hidden * 4);
+    return true;
+}
+
 inline bool VulkanBackend::q35_full_layer(const Q35FullDesc& d, float* x, float* kv_out_host, uint32_t* mirror_valid_out, int async_kv_slot) {
     const bool async = async_kv_slot >= 0;
     if (!ready_ || layer_recording_ || !x || (!kv_out_host && !async) || !rec_pool_ || !layer_cmd_) return nx_decline("!ready_ || layer_recording_ || !x || (!kv_out_host && !async) || !rec_pool_ || !layer_cmd_");
@@ -5215,8 +5295,8 @@ inline bool VulkanBackend::q35_full_layer(const Q35FullDesc& d, float* x, float*
     const bool use_apart2 = !use_apart3 && pipe_q35_apart2_.pipeline && (hd == 128 || hd == 256) && G <= 4;     // register-q kernel (own shared-memory layout)
     if (!use_apart2 && !use_apart3 && (size_t)(KG - 1) * G * hd > 3584) return nx_decline("(size_t)(KG - 1) * G * hd > 3584");      // shared-memory pool of the partial kernel (qwen35_attn_part.comp qs[])
     if (d.rot == 0 || d.rot > hd || (d.rot & 1) || !d.rope_tab) return nx_decline("d.rot == 0 || d.rot > hd || (d.rot & 1) || !d.rope_tab");
-    if (d.hidden == 0 || d.ffn == 0 || !d.k_host || !d.v_host || d.host_tokens < d.pos) return nx_decline("d.hidden == 0 || d.ffn == 0 || !d.k_host || !d.v_host || d.host_tokens < d.pos");
-    if (!d.attn_norm || !d.ffn_norm || !d.wq || !d.wk || !d.wv || !d.wo || !d.gate || !d.up || !d.down) return nx_decline("!d.attn_norm || !d.ffn_norm || !d.wq || !d.wk || !d.wv || !d.wo || !d.gate || !d.up || !d.down");
+    if (d.hidden == 0 || (d.ffn == 0 && !d.attn_only) || !d.k_host || !d.v_host || d.host_tokens < d.pos) return nx_decline("d.hidden == 0 || d.ffn == 0 || !d.k_host || !d.v_host || d.host_tokens < d.pos");
+    if (!d.attn_norm || !d.wq || !d.wk || !d.wv || !d.wo || (!d.attn_only && (!d.ffn_norm || !d.gate || !d.up || !d.down))) return nx_decline("!d.attn_norm || !d.ffn_norm || !d.wq || !d.wk || !d.wv || !d.wo || !d.gate || !d.up || !d.down");
     if (d.has_gate && (!d.q_norm || !d.k_norm)) return nx_decline("gated layer without q/k norm");
     if (!act_bufs_ok() || !act_hidden_.mapped_ptr) return nx_decline("!act_bufs_ok() || !act_hidden_.mapped_ptr");
     const size_t q_dim = (size_t)nh * hd, kv_dim = (size_t)nkv * hd;
@@ -5233,6 +5313,7 @@ inline bool VulkanBackend::q35_full_layer(const Q35FullDesc& d, float* x, float*
     const W mats[] = { {d.wq, wq_rows, d.hidden, d.wq_t}, {d.wk, kv_dim, d.hidden, d.wk_t}, {d.wv, kv_dim, d.hidden, d.wv_t}, {d.wo, d.hidden, q_dim, d.wo_t},
                        {d.gate, d.ffn, d.hidden, d.gate_t}, {d.up, d.ffn, d.hidden, d.up_t}, {d.down, d.hidden, d.ffn, d.down_t} };
     for (const W& m : mats) {
+        if (d.attn_only && (m.p == d.gate || m.p == d.up || m.p == d.down)) continue;   // MoE: no dense FFN in this submit
         Pipeline* pp = pipeline_for(m.t);
         size_t bytes = 0; uint32_t nb = 0;
         if (!pp || !pp->pipeline || !size_for(m.t, m.rows, m.cols, bytes, nb)) return nx_decline("!pp || !pp->pipeline || !size_for(m.t, m.rows, m.cols, bytes, nb)");
@@ -5406,6 +5487,7 @@ inline bool VulkanBackend::q35_full_layer(const Q35FullDesc& d, float* x, float*
     if (d.bo) { ok &= record_add_g(act_ffn_out_2_, wbuf(d.bo, hb), d.hidden); layer_barrier("wo bias"); }
     ok &= record_add_g(act_hidden_, act_ffn_out_2_, d.hidden);
     layer_barrier("residual add");
+    if (!d.attn_only) {
     ok &= record_rms_norm_g(act_hidden_, d.ffn_norm, hb, act_xb_, d.hidden, d.norm_eps);
     layer_barrier("ffn norm");
     record_quant_act_g(act_xb_, d.hidden);
@@ -5418,6 +5500,7 @@ inline bool VulkanBackend::q35_full_layer(const Q35FullDesc& d, float* x, float*
     ok &= record_mat_vec_g(d.down, d.down_t, act_gate_, act_ffn_out_2_, d.hidden, d.ffn);
     layer_barrier("down matvec");
     ok &= record_add_g(act_hidden_, act_ffn_out_2_, d.hidden);
+    }
     if (!ok) {
         const bool was_async = chain_async_; chain_async_ = false;
         if (was_async) { layer_recording_ = false; vkResetCommandBuffer(layer_cmd_, 0); } else end_layer_record(nullptr, 0);
@@ -5960,6 +6043,8 @@ public:
     bool q35_state_download(const void*, int, float*, float*) { return false; }
     void q35_state_drop(const void*, int) {}
     struct Q35FullDesc { const void* owner = nullptr; int layer = 0; };
+    struct MoeJob { const void* gate = nullptr; QuantType gate_t{}; const void* up = nullptr; QuantType up_t{}; const void* down = nullptr; QuantType down_t{}; uint32_t ffn = 0; };
+    bool moe_experts_run(const MoeJob*, int, const float*, uint32_t, float*) { return false; }
     bool q35_full_layer(const Q35FullDesc&, float*, float*, uint32_t*, int = -1) { return false; }
     void q35_kv_drop(const void*, int) {}
     void set_gpu_kv_mb(int) {}
@@ -5978,6 +6063,7 @@ public:
     bool prof_enabled() const { return false; }
     void prof_reset() {}
     void pin_weight_public(const void*) {}
+    void set_q35_v_tiled(bool) {}
     void unpin_weight_public(const void*) {}
     bool evict_weight_public(const void*) { return false; }
     size_t weight_size_public(const void*) { return 0; }

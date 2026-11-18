@@ -311,6 +311,15 @@ std::vector<std::string> Engine::stop_strings() const {
     return impl_->chat_tmpl.stop_strings();
 }
 
+void Engine::set_moe_experts(int mode, int home_n) {
+    impl_->transformer.set_moe_experts(mode, home_n);
+}
+void Engine::set_system_prompt(const std::string& text) {
+    impl_->chat_tmpl.set_system_prompt_override(text);
+    fprintf(stderr, "[chat] System prompt from the launcher (used when a chat sends none): %s\n",
+            text.empty() ? "(none -- no system prompt)" : ("\"" + (text.size() > 120 ? text.substr(0, 117) + "..." : text) + "\"").c_str());
+}
+
 std::string Engine::default_system_prompt() const {
     return impl_->chat_tmpl.default_system_prompt();
 }

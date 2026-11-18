@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 namespace nexus {
@@ -58,6 +59,20 @@ class ChatTemplate {
 public:
     ChatFormat format = ChatFormat::CHATML;
     std::string model_name;
+    // The system prompt set in the launcher (--system-prompt / --system-prompt-file): used whenever a chat does not send
+    // its own, for EVERY chat format. Set but empty = no system prompt at all. Not set = the format's usual one.
+    bool        sys_override_on = false;
+    std::string sys_override;
+    void set_system_prompt_override(const std::string& s) { sys_override = s; sys_override_on = true; }
+    // the launcher's prompt goes in as a system message when the chat has none (the chat's own always wins)
+    std::vector<ChatMessage> with_launcher_system(const std::vector<ChatMessage>& m) const {
+        if (!sys_override_on || sys_override.empty()) return m;
+        for (const auto& x : m) if (x.role == "system") return m;
+        std::vector<ChatMessage> out; out.reserve(m.size() + 1);
+        out.push_back({"system", sys_override});
+        out.insert(out.end(), m.begin(), m.end());
+        return out;
+    }
 
     struct CustomTemplateParts {
         std::string pre_prompt;
@@ -369,7 +384,8 @@ public:
         return format == ChatFormat::QWEN3 || format == ChatFormat::GEMMA4;
     }
 
-    std::string format_prompt(const std::vector<ChatMessage>& messages, int think = -1) const {
+    std::string format_prompt(const std::vector<ChatMessage>& messages_in, int think = -1) const {
+        const std::vector<ChatMessage> messages = with_launcher_system(messages_in);
         switch (format) {
             case ChatFormat::CHATML:        return fmt_chatml(messages);
             case ChatFormat::QWEN3:         return fmt_qwen3(messages, think);
@@ -393,7 +409,8 @@ public:
         return fmt_chatml(messages);
     }
     
-    std::string format_system_prefix(const std::vector<ChatMessage>& messages) const {
+    std::string format_system_prefix(const std::vector<ChatMessage>& messages_in) const {
+        const std::vector<ChatMessage> messages = with_launcher_system(messages_in);
         switch (format) {
             case ChatFormat::CHATML:         return fmt_chatml_system_prefix(messages);
             case ChatFormat::QWEN3:          return fmt_qwen3_system_prefix(messages);
@@ -547,11 +564,19 @@ public:
 
     // Recommended default system prompt for this format/model family
     std::string default_system_prompt() const {
+        if (sys_override_on) return sys_override;
         switch (format) {
             case ChatFormat::CHATML:
                 return "You are a helpful assistant.";
-            case ChatFormat::QWEN3:
-                return "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+            case ChatFormat::QWEN3: {
+                // Qwen's own line only for a model that IS Qwen. The Qwen3 chat format is used by plenty of models that
+                // are not (fine-tunes, your own models from Training Ground), and they were all told they were Qwen.
+                std::string n = model_name;
+                for (char& c : n) c = (char)std::tolower((unsigned char)c);
+                if (n.find("qwen") != std::string::npos)
+                    return "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+                return "You are a helpful assistant.";
+            }
             case ChatFormat::DEEPSEEK:
             case ChatFormat::DEEPSEEK_R1:
                 return "";
@@ -602,8 +627,6 @@ public:
             case ChatFormat::DEEPSEEK_R1:
             case ChatFormat::DEEPSEEK_CODER:
                 return false;  // BOS causes confusion in DeepSeek formats
-            case ChatFormat::ZEPHYR:
-                return true;   // TinyLlama / Zephyr: Llama tokenizer, <s> starts every sequence
             case ChatFormat::PHI3:
             case ChatFormat::PHI4:
                 return false;  // Phi template is self-contained

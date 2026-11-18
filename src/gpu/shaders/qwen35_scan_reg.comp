@@ -63,8 +63,11 @@ void main() {
     const uint j    = tid & 127u;         // state column
     if (hv >= pc.vh || pc.hd != HD || pc.repeat == 0u) return;
 
-    const uint hk = hv / pc.repeat;
-    const uint rr = hv - hk * pc.repeat;
+    // pc.grouped: 0 = flat [Q][K][V], value heads grouped by key head (HF / .nxm order) -> key head = hv / repeat
+    //             1 = grouped-span conv layout (old Qwen3-Next GGUF)
+    //             2 = flat, value heads TILED (llama.cpp Qwen 3.5 GGUF: k0v0 k1v0 .. k0v1 k1v1 ..) -> key head = hv mod kh
+    const uint hk = (pc.grouped == 2u) ? (hv % pc.kh) : (hv / pc.repeat);
+    const uint rr = (pc.grouped == 2u) ? (hv / pc.kh) : (hv - hk * pc.repeat);
     const uint state_base = hv * HD * HD + part * 32u * HD;
     const uint row0 = part * 32u;
 
@@ -107,7 +110,7 @@ void main() {
 
     for (uint t = 0u; t < pc.n_tokens; ++t) {
         uint qoff, koff, voff;
-        if (pc.grouped != 0u) {
+        if (pc.grouped == 1u) {
             const uint group_span = 2u * HD + pc.repeat * HD;
             const uint base = t * pc.conv_dim + hk * group_span;
             qoff = base; koff = base + HD; voff = base + 2u * HD + rr * HD;
